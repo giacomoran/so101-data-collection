@@ -111,3 +111,43 @@ graph LR
 ## Notes
 
 - Single experimenter (you)
+
+---
+
+## Implementation Decisions
+
+### Data Collection Script (`src/collect.py`)
+
+**Memory Buffering Strategy**:
+
+- Episodes are buffered in memory (as numpy arrays) to prevent dataset corruption on crashes
+- Buffer flushes to disk every 10 episodes (configurable via `--buffer-size`)
+- RAM calculation: 640×480×3 @ 30fps × 20s × 2 cameras ≈ 1 GB/episode
+- 10 episodes = ~10 GB RAM
+
+**Hand-Guided Mode**:
+
+- Uses a single arm (physically the leader arm with trigger handle)
+- Arm connected as `SO101Leader` (torque disabled for free movement)
+- Same joint positions used for BOTH `observation.state` AND `action` (identical values)
+- This matches standard teleop where leader→action, follower→observation, except both come from one arm
+
+**Camera Resolution**:
+
+- Capture at 640×480 (not native 1080p)
+- Resolution set at camera connection time via OpenCV, no post-capture downscaling
+- LeRobot dataset stores frames as PNG, encodes to MP4 at flush time
+
+**Benchmark Metrics**:
+
+- Tracked in `benchmark_metrics.csv` (persists across sessions)
+- Encoding time tracked separately and subtracted from collection time
+- Qualitative notes prompted at end of each session
+
+**LeRobot Dataset Format**:
+
+- Using v3 format with `LeRobotDataset.create()`
+- Videos encoded in batches when buffer flushes
+- Reference docs:
+  - https://huggingface.co/docs/lerobot/en/lerobot-dataset-v3
+  - https://huggingface.co/blog/lerobot-datasets-v3
