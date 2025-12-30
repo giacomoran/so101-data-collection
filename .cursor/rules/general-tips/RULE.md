@@ -15,3 +15,8 @@ When working with LeRobot datasets, refer to the official documentation:
 
 - **Dataset Format**: https://huggingface.co/docs/lerobot/en/lerobot-dataset-v3
 - **Blog Post**: https://huggingface.co/blog/lerobot-datasets-v3
+
+## Naming Conventions
+
+- **HuggingFace repos/datasets**: Use underscores `_` instead of hyphens `-` in names (e.g., `cube_hand_guided` not `cube-hand-guided`)
+- **Task names**: Use short names: `cube`, `gba`, `ball` (not `pick_place_cube`, `press_gba`, `throw_ball`)

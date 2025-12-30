@@ -3,9 +3,7 @@
 Push a locally saved dataset to HuggingFace Hub.
 
 Usage:
-    python -m src.push_to_hub \
-        --task pick_place_cube \
-        --method hand_guided
+    python -m src.push_to_hub --dataset-name cube_hand_guided
 """
 
 from __future__ import annotations
@@ -22,7 +20,7 @@ if str(_project_root) not in sys.path:
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 
-from src.collect import DEFAULT_DATASET_ROOT, Method, Task  # noqa: E402
+from src.collect import DEFAULT_DATASET_ROOT  # noqa: E402
 from src.setup import HF_REPO_ID  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -30,17 +28,21 @@ logger = logging.getLogger(__name__)
 
 
 def push_dataset_to_hub(
-    task: Task, method: Method, dataset_root: Path = DEFAULT_DATASET_ROOT
+    dataset_name: str, dataset_root: Path = DEFAULT_DATASET_ROOT
 ) -> None:
     """Push a dataset to HuggingFace Hub."""
-    # Construct dataset name and paths (same as collect.py)
-    dataset_name = f"{task.value}_{method.value}"
-    repo_id = f"{HF_REPO_ID}-{dataset_name}"
     dataset_path = dataset_root / dataset_name
 
     if not dataset_path.exists():
         logger.error(f"Dataset directory not found: {dataset_path}")
         sys.exit(1)
+
+    # Enforce naming convention: HuggingFace repo names should use underscores, not hyphens
+    assert "-" not in HF_REPO_ID, (
+        f"HF_REPO_ID '{HF_REPO_ID}' contains hyphens. "
+        "Use underscores instead (e.g., 'user_name/repo_name')."
+    )
+    repo_id = f"{HF_REPO_ID}_{dataset_name}"
 
     logger.info(f"Loading dataset from: {dataset_path}")
     logger.info(f"Pushing to HuggingFace Hub: {repo_id}")
@@ -65,18 +67,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--task",
+        "--dataset-name",
         type=str,
         required=True,
-        choices=[t.value for t in Task],
-        help="Task name",
-    )
-    parser.add_argument(
-        "--method",
-        type=str,
-        required=True,
-        choices=[m.value for m in Method],
-        help="Collection method",
+        help="Name of the dataset directory in /data (e.g., 'cube_hand_guided')",
     )
     parser.add_argument(
         "--dataset-root",
@@ -90,9 +84,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    task = Task(args.task)
-    method = Method(args.method)
-    push_dataset_to_hub(task, method, args.dataset_root)
+    push_dataset_to_hub(args.dataset_name, args.dataset_root)
 
 
 if __name__ == "__main__":

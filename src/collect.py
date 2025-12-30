@@ -9,14 +9,14 @@ Supports three collection methods:
 
 Usage:
     python -m src.collect \
-        --task pick_place_cube \
+        --task cube \
         --method hand_guided \
         --num-episodes 50 \
         --buffer-size 10
 
     # Warmup mode (no saving):
     python -m src.collect \
-        --task pick_place_cube \
+        --task cube \
         --method hand_guided \
         --warmup \
         --num-episodes 10
@@ -78,6 +78,16 @@ logger = logging.getLogger(__name__)
 # Configuration Defaults
 # ============================================================================
 
+# Motor order for observation.state and action arrays (must match features definition)
+MOTOR_NAMES = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+]
+
 # Default collection parameters
 DEFAULT_NUM_EPISODES: int = 50
 DEFAULT_BUFFER_SIZE: int = 10
@@ -90,9 +100,9 @@ DEFAULT_PLAY_SOUNDS: bool = True
 
 # Task definitions
 class Task(str, Enum):
-    PICK_PLACE_CUBE = "pick_place_cube"
-    PRESS_GBA = "press_gba"
-    THROW_BALL = "throw_ball"
+    CUBE = "cube"
+    GBA = "gba"
+    BALL = "ball"
 
 
 class Method(str, Enum):
@@ -102,9 +112,9 @@ class Method(str, Enum):
 
 
 TASK_DESCRIPTIONS = {
-    Task.PICK_PLACE_CUBE: "Pick up the cube and place it in the target location",
-    Task.PRESS_GBA: "Press the up arrow on the GBA",
-    Task.THROW_BALL: "Throw the ping-pong ball into the basket",
+    Task.CUBE: "Pick up the cube and place it in the target location",
+    Task.GBA: "Press the up arrow on the GBA",
+    Task.BALL: "Throw the ping-pong ball into the basket",
 }
 
 
@@ -287,18 +297,20 @@ def create_leader_teleop_setup(
 
 def get_observation_features(cameras: dict[str, OpenCVCamera]) -> dict[str, Any]:
     """Get observation features for dataset creation."""
-    # Motor positions (6 joints)
-    motor_names = [
-        "shoulder_pan",
-        "shoulder_lift",
-        "elbow_flex",
-        "wrist_flex",
-        "wrist_roll",
-        "gripper",
-    ]
+    # Single observation.state array with all 6 joint positions
     features = {
-        f"observation.state.{name}.pos": {"dtype": "float32", "shape": (1,)}
-        for name in motor_names
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [
+                "shoulder_pan",
+                "shoulder_lift",
+                "elbow_flex",
+                "wrist_flex",
+                "wrist_roll",
+                "gripper",
+            ],
+        }
     }
 
     # Camera images
@@ -314,17 +326,20 @@ def get_observation_features(cameras: dict[str, OpenCVCamera]) -> dict[str, Any]
 
 def get_action_features() -> dict[str, Any]:
     """Get action features for dataset creation."""
-    motor_names = [
-        "shoulder_pan",
-        "shoulder_lift",
-        "elbow_flex",
-        "wrist_flex",
-        "wrist_roll",
-        "gripper",
-    ]
+    # Single action array with all 6 joint positions
     return {
-        f"action.{name}.pos": {"dtype": "float32", "shape": (1,)}
-        for name in motor_names
+        "action": {
+            "dtype": "float32",
+            "shape": (6,),
+            "names": [
+                "shoulder_pan",
+                "shoulder_lift",
+                "elbow_flex",
+                "wrist_flex",
+                "wrist_roll",
+                "gripper",
+            ],
+        }
     }
 
 
@@ -482,6 +497,24 @@ def check_and_remove_existing_dataset(dataset_path: Path) -> None:
             sys.exit(1)
 
 
+def _state_dict_to_array(state_dict: dict[str, float]) -> np.ndarray:
+    """
+    Convert a state dict like {shoulder_pan.pos: value, ...} to a numpy array.
+
+    The array order matches MOTOR_NAMES.
+    """
+    values = []
+    for motor_name in MOTOR_NAMES:
+        key = f"{motor_name}.pos"
+        if key in state_dict:
+            values.append(state_dict[key])
+        else:
+            raise KeyError(
+                f"Missing motor key {key} in state dict. Available: {list(state_dict.keys())}"
+            )
+    return np.array(values, dtype=np.float32)
+
+
 def flush_to_dataset(
     episodes: list[EpisodeBuffer],
     dataset: LeRobotDataset,
@@ -499,19 +532,17 @@ def flush_to_dataset(
             # Build frame dict for LeRobotDataset
             frame_dict: dict[str, Any] = {"task": episode.task}
 
-            # Add observation state
-            for motor_key, value in frame.observation_state.items():
-                frame_dict[f"observation.state.{motor_key}"] = np.array(
-                    [value], dtype=np.float32
-                )
+            # Convert observation state dict to array
+            frame_dict["observation.state"] = _state_dict_to_array(
+                frame.observation_state
+            )
 
             # Add observation images
             for cam_name, image in frame.observation_images.items():
                 frame_dict[f"observation.images.{cam_name}"] = image
 
-            # Add action
-            for motor_key, value in frame.action.items():
-                frame_dict[f"action.{motor_key}"] = np.array([value], dtype=np.float32)
+            # Convert action dict to array
+            frame_dict["action"] = _state_dict_to_array(frame.action)
 
             dataset.add_frame(frame_dict)
 
@@ -551,7 +582,12 @@ def collect(config: CollectConfig) -> None:
     dataset = None
     if not config.warmup:
         dataset_name = f"{config.task.value}_{config.method.value}"
-        repo_id = f"{config.repo_id}-{dataset_name}"
+        # Enforce naming convention: HuggingFace repo names should use underscores, not hyphens
+        assert "-" not in config.repo_id, (
+            f"repo_id '{config.repo_id}' contains hyphens. "
+            "Use underscores instead (e.g., 'user_name/repo_name')."
+        )
+        repo_id = f"{config.repo_id}_{dataset_name}"
         dataset_path = config.dataset_root / dataset_name
 
         # Check if dataset directory exists and prompt for deletion
@@ -701,7 +737,12 @@ def collect(config: CollectConfig) -> None:
         # Prompt to push to HuggingFace Hub
         if dataset is not None:
             dataset_name = f"{config.task.value}_{config.method.value}"
-            repo_id = f"{config.repo_id}-{dataset_name}"
+            # Enforce naming convention: HuggingFace repo names should use underscores, not hyphens
+            assert "-" not in config.repo_id, (
+                f"repo_id '{config.repo_id}' contains hyphens. "
+                "Use underscores instead (e.g., 'user_name/repo_name')."
+            )
+            repo_id = f"{config.repo_id}_{dataset_name}"
             push_response = input(
                 f"\nPush dataset to HuggingFace Hub ({repo_id})? [y/N]: "
             )
@@ -714,7 +755,7 @@ def collect(config: CollectConfig) -> None:
             if push_response_clean in ("y", "yes"):
                 logger.info(f"Pushing dataset to {repo_id}...")
                 try:
-                    dataset.push_to_hub(repo_id=repo_id)
+                    dataset.push_to_hub()
                     logger.info("Dataset pushed successfully!")
                 except Exception as e:
                     logger.error(f"Failed to push dataset to Hub: {e}", exc_info=True)

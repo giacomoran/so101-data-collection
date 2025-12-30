@@ -27,8 +27,12 @@
           shellHook = ''
             echo "ffmpeg version: $(ffmpeg -version | head -n 1)"
 
-            # Ensure PyAV finds nix-installed ffmpeg headers/libs
-            export PKG_CONFIG_PATH="${ffmpeg-pkg}/lib/pkgconfig:$PKG_CONFIG_PATH"
+            # Ensure PyAV finds nix-installed ffmpeg headers/libs (compile time)
+            export PKG_CONFIG_PATH="${ffmpeg-pkg.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
+
+            # Ensure torchcodec finds nix-installed ffmpeg libs (runtime)
+            # Use .lib output which contains the actual shared libraries
+            export DYLD_LIBRARY_PATH="${ffmpeg-pkg.lib}/lib:$DYLD_LIBRARY_PATH"
           '';
         };
       }
