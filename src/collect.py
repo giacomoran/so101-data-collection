@@ -18,6 +18,13 @@ Usage:
         --setup hand_guided \
         --num-episodes 50
 
+    # Resume mode: continue recording on existing dataset
+    python -m src.collect \
+        --task cube \
+        --setup hand_guided \
+        --num-episodes 10 \
+        --resume
+
     # Benchmark mode: collect for 15 minutes (900s), no encoding during collection
     python -m src.collect \
         --task cube \
@@ -135,6 +142,8 @@ class CollectConfig:
     fps: int = DEFAULT_FPS
     episode_time_s: float = DEFAULT_EPISODE_TIME_S
     reset_time_s: float = DEFAULT_RESET_TIME_S
+    # Resume recording on an existing dataset
+    resume: bool = False
 
     @property
     def is_benchmark_mode(self) -> bool:
@@ -592,7 +601,7 @@ def collect(config: CollectConfig) -> None:
     # Create memory buffer
     memory_buffer = MemoryBuffer(buffer_size=config.buffer_size)
 
-    # Create dataset
+    # Create or load dataset
     dataset_name = f"{config.task.value}_{config.setup.value}"
     # Enforce naming convention: HuggingFace repo names should use underscores, not hyphens
     assert "-" not in config.repo_id, (
@@ -602,20 +611,29 @@ def collect(config: CollectConfig) -> None:
     repo_id = f"{config.repo_id}_{dataset_name}"
     dataset_path = config.dataset_root / dataset_name
 
-    # Check if dataset directory exists and prompt for deletion
-    check_and_remove_existing_dataset(dataset_path)
+    if config.resume:
+        # Resume recording on existing dataset
+        if not dataset_path.exists():
+            logger.error(f"Cannot resume: dataset directory not found: {dataset_path}")
+            sys.exit(1)
+        logger.info(f"Resuming recording on existing dataset: {dataset_path}")
+        dataset = LeRobotDataset(repo_id=repo_id, root=dataset_path)
+        logger.info(f"Existing dataset has {dataset.num_episodes} episodes")
+    else:
+        # Check if dataset directory exists and prompt for deletion
+        check_and_remove_existing_dataset(dataset_path)
 
-    # Build features from observation/action structure
-    features = build_dataset_features(cameras)
+        # Build features from observation/action structure
+        features = build_dataset_features(cameras)
 
-    dataset = LeRobotDataset.create(
-        repo_id=repo_id,
-        fps=config.fps,
-        root=dataset_path,
-        robot_type="so101",
-        features=features,
-        use_videos=True,
-    )
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=config.fps,
+            root=dataset_path,
+            robot_type="so101",
+            features=features,
+            use_videos=True,
+        )
 
     # Setup based on collection setup
     arm = None
@@ -778,25 +796,10 @@ def collect(config: CollectConfig) -> None:
         logger.info(
             f"Net collection time: {total_collection_time - total_encoding_time:.1f}s"
         )
-
-        # Prompt to push to HuggingFace Hub
-        push_response = input(f"\nPush dataset to HuggingFace Hub ({repo_id})? [y/N]: ")
-        push_response_clean = push_response.strip().lower()
+        logger.info(f"Dataset saved to: {dataset_path}")
         logger.info(
-            f"Push response received: {repr(push_response)} "
-            f"(cleaned: {repr(push_response_clean)}, "
-            f"matches: {push_response_clean in ('y', 'yes')})"
+            f"To push to HuggingFace Hub, run: python -m src.push_to_hub --dataset-name {dataset_name}"
         )
-        if push_response_clean in ("y", "yes"):
-            logger.info(f"Pushing dataset to {repo_id}...")
-            try:
-                dataset.push_to_hub()
-                logger.info("Dataset pushed successfully!")
-            except Exception as e:
-                logger.error(f"Failed to push dataset to Hub: {e}", exc_info=True)
-                logger.info("Dataset saved locally.")
-        else:
-            logger.info("Skipping push to Hub. Dataset saved locally.")
 
     finally:
         # Cleanup
@@ -934,11 +937,18 @@ def parse_args() -> CollectConfig:
         action="store_true",
         help="Disable sound feedback",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume recording on an existing dataset (incompatible with --benchmark)",
+    )
 
     args = parser.parse_args()
 
     # Determine mode: benchmark or regular
     if args.benchmark is not None:
+        if args.resume:
+            parser.error("--resume is incompatible with --benchmark mode")
         num_episodes = None
         benchmark_time_s = args.benchmark
     else:
@@ -964,6 +974,7 @@ def parse_args() -> CollectConfig:
         camera_height=args.camera_height,
         repo_id=args.repo_id,
         play_sounds=not args.no_sound,
+        resume=args.resume,
     )
 
 
