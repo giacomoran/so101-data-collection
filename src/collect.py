@@ -2,24 +2,27 @@
 """
 Data collection script for SO-101 benchmark.
 
-Supports three collection methods:
+Supports three collection setups:
 - phone_teleop: Phone controls end-effector
 - leader_teleop: Standard leader-follower teleoperation
 - hand_guided: Single arm provides both observation and action
 
-Usage:
-    python -m src.collect \
-        --task cube \
-        --method hand_guided \
-        --num-episodes 50 \
-        --buffer-size 10
+Two collection modes:
+1. Regular mode (--num-episodes): Collect N episodes, flush to disk periodically
+2. Benchmark mode (--benchmark): Time-capped, all data in RAM, encode after collection
 
-    # Warmup mode (no saving):
+Usage:
+    # Regular mode: collect 50 episodes
     python -m src.collect \
         --task cube \
-        --method hand_guided \
-        --warmup \
-        --num-episodes 10
+        --setup hand_guided \
+        --num-episodes 50
+
+    # Benchmark mode: collect for 15 minutes (900s), no encoding during collection
+    python -m src.collect \
+        --task cube \
+        --setup hand_guided \
+        --benchmark 900
 """
 
 from __future__ import annotations
@@ -90,6 +93,7 @@ MOTOR_NAMES = [
 
 # Default collection parameters
 DEFAULT_NUM_EPISODES: int = 50
+DEFAULT_BENCHMARK_TIME_S: float = 900.0  # 15 minutes per condition (UMI paper approach)
 DEFAULT_BUFFER_SIZE: int = 10
 DEFAULT_FPS: int = 30
 DEFAULT_EPISODE_TIME_S: float = 20.0
@@ -105,7 +109,7 @@ class Task(str, Enum):
     BALL = "ball"
 
 
-class Method(str, Enum):
+class Setup(str, Enum):
     PHONE_TELEOP = "phone_teleop"
     LEADER_TELEOP = "leader_teleop"
     HAND_GUIDED = "hand_guided"
@@ -123,13 +127,19 @@ class CollectConfig:
     """Configuration for data collection."""
 
     task: Task
-    method: Method
-    num_episodes: int = DEFAULT_NUM_EPISODES
-    warmup: bool = False
+    setup: Setup
+    # Collection mode: either num_episodes (regular) or benchmark_time_s (benchmark mode)
+    num_episodes: int | None = DEFAULT_NUM_EPISODES
+    benchmark_time_s: float | None = None  # If set, enables benchmark mode
     buffer_size: int = DEFAULT_BUFFER_SIZE
     fps: int = DEFAULT_FPS
     episode_time_s: float = DEFAULT_EPISODE_TIME_S
     reset_time_s: float = DEFAULT_RESET_TIME_S
+
+    @property
+    def is_benchmark_mode(self) -> bool:
+        """True if running in benchmark mode (time-capped, RAM-only)."""
+        return self.benchmark_time_s is not None
 
     # Robot config (from setup.py)
     robot_port: str = ROBOT_PORT
@@ -557,11 +567,15 @@ def collect(config: CollectConfig) -> None:
     init_logging()
 
     logger.info(
-        f"Starting data collection: task={config.task.value}, method={config.method.value}"
+        f"Starting data collection: task={config.task.value}, setup={config.setup.value}"
     )
-    logger.info(f"Warmup mode: {config.warmup}")
-    logger.info(f"Episodes to record: {config.num_episodes}")
-    logger.info(f"Buffer size: {config.buffer_size}")
+    if config.is_benchmark_mode:
+        logger.info(
+            f"BENCHMARK MODE: {config.benchmark_time_s / 60:.1f} minutes, RAM-only (no encoding during collection)"
+        )
+    else:
+        logger.info(f"Regular mode: {config.num_episodes} episodes")
+        logger.info(f"Buffer size: {config.buffer_size}")
 
     task_description = TASK_DESCRIPTIONS[config.task]
 
@@ -578,48 +592,46 @@ def collect(config: CollectConfig) -> None:
     # Create memory buffer
     memory_buffer = MemoryBuffer(buffer_size=config.buffer_size)
 
-    # Create dataset (only if not in warmup mode)
-    dataset = None
-    if not config.warmup:
-        dataset_name = f"{config.task.value}_{config.method.value}"
-        # Enforce naming convention: HuggingFace repo names should use underscores, not hyphens
-        assert "-" not in config.repo_id, (
-            f"repo_id '{config.repo_id}' contains hyphens. "
-            "Use underscores instead (e.g., 'user_name/repo_name')."
-        )
-        repo_id = f"{config.repo_id}_{dataset_name}"
-        dataset_path = config.dataset_root / dataset_name
+    # Create dataset
+    dataset_name = f"{config.task.value}_{config.setup.value}"
+    # Enforce naming convention: HuggingFace repo names should use underscores, not hyphens
+    assert "-" not in config.repo_id, (
+        f"repo_id '{config.repo_id}' contains hyphens. "
+        "Use underscores instead (e.g., 'user_name/repo_name')."
+    )
+    repo_id = f"{config.repo_id}_{dataset_name}"
+    dataset_path = config.dataset_root / dataset_name
 
-        # Check if dataset directory exists and prompt for deletion
-        check_and_remove_existing_dataset(dataset_path)
+    # Check if dataset directory exists and prompt for deletion
+    check_and_remove_existing_dataset(dataset_path)
 
-        # Build features from observation/action structure
-        features = build_dataset_features(cameras)
+    # Build features from observation/action structure
+    features = build_dataset_features(cameras)
 
-        dataset = LeRobotDataset.create(
-            repo_id=repo_id,
-            fps=config.fps,
-            root=dataset_path,
-            robot_type="so101",
-            features=features,
-            use_videos=True,
-        )
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id,
+        fps=config.fps,
+        root=dataset_path,
+        robot_type="so101",
+        features=features,
+        use_videos=True,
+    )
 
-    # Setup based on method
+    # Setup based on collection setup
     arm = None
     robot = None
     leader = None
     listener = None
 
     try:
-        if config.method == Method.HAND_GUIDED:
+        if config.setup == Setup.HAND_GUIDED:
             arm = create_hand_guided_arm(config)
             arm.connect()
-        elif config.method == Method.LEADER_TELEOP:
+        elif config.setup == Setup.LEADER_TELEOP:
             robot, leader = create_leader_teleop_setup(config)
             robot.connect()
             leader.connect()
-        elif config.method == Method.PHONE_TELEOP:
+        elif config.setup == Setup.PHONE_TELEOP:
             raise NotImplementedError("Phone teleop not yet implemented")
 
         # Connect cameras
@@ -631,19 +643,40 @@ def collect(config: CollectConfig) -> None:
 
         recorded_episodes = 0
         collection_start = time.perf_counter()
+        session_elapsed = 0.0
 
-        while recorded_episodes < config.num_episodes and not events["stop_recording"]:
+        # Determine loop condition based on mode
+        def should_continue() -> bool:
+            if config.is_benchmark_mode:
+                return (
+                    session_elapsed < config.benchmark_time_s
+                    and not events["stop_recording"]
+                )
+            else:
+                return (
+                    recorded_episodes < config.num_episodes
+                    and not events["stop_recording"]
+                )
+
+        while should_continue():
             episode_num = recorded_episodes + 1
-            log_say(
-                f"Recording episode {episode_num} of {config.num_episodes}",
-                config.play_sounds,
-            )
+            if config.is_benchmark_mode:
+                remaining_min = (config.benchmark_time_s - session_elapsed) / 60
+                log_say(
+                    f"Recording episode {episode_num} ({remaining_min:.1f} min remaining)",
+                    config.play_sounds,
+                )
+            else:
+                log_say(
+                    f"Recording episode {episode_num} of {config.num_episodes}",
+                    config.play_sounds,
+                )
 
             # Start new episode
             memory_buffer.start_episode(task_description)
 
-            # Record based on method
-            if config.method == Method.HAND_GUIDED:
+            # Record based on setup
+            if config.setup == Setup.HAND_GUIDED:
                 record_loop_hand_guided(
                     arm=arm,
                     cameras=cameras,
@@ -652,7 +685,7 @@ def collect(config: CollectConfig) -> None:
                     config=config,
                     task_description=task_description,
                 )
-            elif config.method == Method.LEADER_TELEOP:
+            elif config.setup == Setup.LEADER_TELEOP:
                 record_loop_leader_teleop(
                     robot=robot,
                     leader=leader,
@@ -678,8 +711,8 @@ def collect(config: CollectConfig) -> None:
             memory_buffer.save_episode()
             recorded_episodes += 1
 
-            # Flush to disk if buffer is full (and not in warmup mode)
-            if memory_buffer.should_flush() and dataset is not None:
+            # Flush to disk if buffer is full (skip in benchmark mode - keep everything in RAM)
+            if not config.is_benchmark_mode and memory_buffer.should_flush():
                 log_say("Saving to disk...", config.play_sounds)
                 episodes_to_flush = memory_buffer.get_episodes_to_flush()
                 encoding_time = flush_to_dataset(episodes_to_flush, dataset, config)
@@ -689,42 +722,54 @@ def collect(config: CollectConfig) -> None:
                     f"(encoding took {encoding_time:.1f}s)"
                 )
 
-            # Reset time (skip for last episode)
-            if recorded_episodes < config.num_episodes and not events["stop_recording"]:
+            # Update elapsed time (excluding encoding time)
+            session_elapsed = (
+                time.perf_counter() - collection_start - total_encoding_time
+            )
+
+            # Reset time (skip if done)
+            if should_continue():
                 log_say("Reset the environment", config.play_sounds)
                 reset_loop(events, config)
+                session_elapsed = (
+                    time.perf_counter() - collection_start - total_encoding_time
+                )
 
         collection_end = time.perf_counter()
+        total_collection_time = collection_end - collection_start
 
-        # Flush remaining episodes
-        if memory_buffer.num_buffered > 0 and dataset is not None:
-            log_say("Saving remaining episodes...", config.play_sounds)
+        # Record metrics BEFORE encoding (so benchmark metrics reflect pure collection time)
+        session_end = time.time()
+        metrics = SessionMetrics(
+            task=config.task.value,
+            setup=config.setup.value,
+            session_start=session_start,
+            session_end=session_end,
+            collection_time_s=total_collection_time - total_encoding_time,
+            encoding_time_s=total_encoding_time,  # Will be 0 for benchmark mode at this point
+            episodes_recorded=recorded_episodes,
+            total_frames=total_frames,
+            mistakes=mistakes,
+        )
+        tracker.log_session(metrics)
+        logger.info(f"Session metrics saved to {tracker.csv_path}")
+
+        # Flush all remaining episodes to disk
+        if memory_buffer.num_buffered > 0:
+            if config.is_benchmark_mode:
+                log_say(
+                    f"Encoding {memory_buffer.num_buffered} episodes to disk...",
+                    config.play_sounds,
+                )
+            else:
+                log_say("Saving remaining episodes...", config.play_sounds)
             episodes_to_flush = memory_buffer.get_episodes_to_flush()
             encoding_time = flush_to_dataset(episodes_to_flush, dataset, config)
             total_encoding_time += encoding_time
+            logger.info(f"Encoding took {encoding_time:.1f}s")
 
         # Finalize dataset
-        if dataset is not None:
-            dataset.finalize()
-
-        session_end = time.time()
-        total_collection_time = collection_end - collection_start
-
-        # Record metrics
-        if not config.warmup:
-            metrics = SessionMetrics(
-                task=config.task.value,
-                method=config.method.value,
-                session_start=session_start,
-                session_end=session_end,
-                collection_time_s=total_collection_time - total_encoding_time,
-                encoding_time_s=total_encoding_time,
-                episodes_recorded=recorded_episodes,
-                total_frames=total_frames,
-                mistakes=mistakes,
-            )
-            tracker.log_session(metrics)
-            logger.info(f"Session metrics saved to {tracker.csv_path}")
+        dataset.finalize()
 
         log_say("Recording complete", config.play_sounds, blocking=True)
         logger.info(f"Recorded {recorded_episodes} episodes")
@@ -735,33 +780,23 @@ def collect(config: CollectConfig) -> None:
         )
 
         # Prompt to push to HuggingFace Hub
-        if dataset is not None:
-            dataset_name = f"{config.task.value}_{config.method.value}"
-            # Enforce naming convention: HuggingFace repo names should use underscores, not hyphens
-            assert "-" not in config.repo_id, (
-                f"repo_id '{config.repo_id}' contains hyphens. "
-                "Use underscores instead (e.g., 'user_name/repo_name')."
-            )
-            repo_id = f"{config.repo_id}_{dataset_name}"
-            push_response = input(
-                f"\nPush dataset to HuggingFace Hub ({repo_id})? [y/N]: "
-            )
-            push_response_clean = push_response.strip().lower()
-            logger.info(
-                f"Push response received: {repr(push_response)} "
-                f"(cleaned: {repr(push_response_clean)}, "
-                f"matches: {push_response_clean in ('y', 'yes')})"
-            )
-            if push_response_clean in ("y", "yes"):
-                logger.info(f"Pushing dataset to {repo_id}...")
-                try:
-                    dataset.push_to_hub()
-                    logger.info("Dataset pushed successfully!")
-                except Exception as e:
-                    logger.error(f"Failed to push dataset to Hub: {e}", exc_info=True)
-                    logger.info("Dataset saved locally.")
-            else:
-                logger.info("Skipping push to Hub. Dataset saved locally.")
+        push_response = input(f"\nPush dataset to HuggingFace Hub ({repo_id})? [y/N]: ")
+        push_response_clean = push_response.strip().lower()
+        logger.info(
+            f"Push response received: {repr(push_response)} "
+            f"(cleaned: {repr(push_response_clean)}, "
+            f"matches: {push_response_clean in ('y', 'yes')})"
+        )
+        if push_response_clean in ("y", "yes"):
+            logger.info(f"Pushing dataset to {repo_id}...")
+            try:
+                dataset.push_to_hub()
+                logger.info("Dataset pushed successfully!")
+            except Exception as e:
+                logger.error(f"Failed to push dataset to Hub: {e}", exc_info=True)
+                logger.info("Dataset saved locally.")
+        else:
+            logger.info("Skipping push to Hub. Dataset saved locally.")
 
     finally:
         # Cleanup
@@ -793,28 +828,34 @@ def parse_args() -> CollectConfig:
         help="Task to collect data for",
     )
     parser.add_argument(
-        "--method",
+        "--setup",
         type=str,
         required=True,
-        choices=[m.value for m in Method],
-        help="Data collection method",
+        choices=[s.value for s in Setup],
+        help="Data collection setup",
     )
-    parser.add_argument(
+
+    # Collection mode: either --num-episodes (regular) or --benchmark (time-capped)
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--num-episodes",
         type=int,
         default=DEFAULT_NUM_EPISODES,
-        help="Number of episodes to record",
+        help="Number of episodes to record (regular mode)",
     )
-    parser.add_argument(
-        "--warmup",
-        action="store_true",
-        help="Warmup mode: run demos without saving to dataset",
+    mode_group.add_argument(
+        "--benchmark",
+        type=float,
+        metavar="SECONDS",
+        help="Benchmark mode: collect for N seconds with no encoding (default: 900 = 15 min). "
+        "All data stays in RAM during collection.",
     )
+
     parser.add_argument(
         "--buffer-size",
         type=int,
         default=DEFAULT_BUFFER_SIZE,
-        help="Number of episodes to buffer before flushing to disk",
+        help="Number of episodes to buffer before flushing to disk (regular mode only)",
     )
     parser.add_argument(
         "--fps",
@@ -896,11 +937,19 @@ def parse_args() -> CollectConfig:
 
     args = parser.parse_args()
 
+    # Determine mode: benchmark or regular
+    if args.benchmark is not None:
+        num_episodes = None
+        benchmark_time_s = args.benchmark
+    else:
+        num_episodes = args.num_episodes
+        benchmark_time_s = None
+
     return CollectConfig(
         task=Task(args.task),
-        method=Method(args.method),
-        num_episodes=args.num_episodes,
-        warmup=args.warmup,
+        setup=Setup(args.setup),
+        num_episodes=num_episodes,
+        benchmark_time_s=benchmark_time_s,
         buffer_size=args.buffer_size,
         fps=args.fps,
         episode_time_s=args.episode_time,

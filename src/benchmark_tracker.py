@@ -17,7 +17,7 @@ class SessionMetrics:
     """Metrics for a single data collection session."""
 
     task: str
-    method: str
+    setup: str
     session_start: float  # Unix timestamp
     session_end: float  # Unix timestamp
     collection_time_s: float  # Wall-clock time minus encoding time
@@ -40,7 +40,7 @@ class SessionMetrics:
         """Convert to CSV row dict."""
         return {
             "task": self.task,
-            "method": self.method,
+            "setup": self.setup,
             "session_start": self.session_start_iso,
             "session_end": self.session_end_iso,
             "collection_time_s": round(self.collection_time_s, 2),
@@ -60,7 +60,7 @@ class BenchmarkTracker:
 
     CSV_COLUMNS = [
         "task",
-        "method",
+        "setup",
         "session_start",
         "session_end",
         "collection_time_s",
@@ -114,16 +114,16 @@ class BenchmarkTracker:
 
     def get_summary_by_condition(self) -> dict[tuple[str, str], dict]:
         """
-        Get aggregated summary statistics by (task, method) condition.
+        Get aggregated summary statistics by (task, setup) condition.
 
         Returns:
-            Dictionary mapping (task, method) to aggregated stats.
+            Dictionary mapping (task, setup) to aggregated stats.
         """
         sessions = self.load_all_sessions()
         summary: dict[tuple[str, str], dict] = {}
 
         for session in sessions:
-            key = (session["task"], session["method"])
+            key = (session["task"], session["setup"])
             if key not in summary:
                 summary[key] = {
                     "total_collection_time_s": 0.0,
@@ -157,8 +157,8 @@ class BenchmarkTracker:
         print("BENCHMARK SUMMARY")
         print("=" * 80)
 
-        for (task, method), stats in sorted(summary.items()):
-            print(f"\n{task} / {method}:")
+        for (task, setup), stats in sorted(summary.items()):
+            print(f"\n{task} / {setup}:")
             print(f"  Sessions:          {stats['sessions']}")
             print(f"  Total episodes:    {stats['total_episodes']}")
             print(f"  Total frames:      {stats['total_frames']}")

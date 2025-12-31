@@ -1,10 +1,10 @@
-# Data Collection Methods Benchmark
+# Data Collection Setups Benchmark
 
 ## Overview
 
-A personal benchmark experiment comparing three robot data collection methods across three manipulation tasks. The goal is to verify intuitions about the trade-offs between different teleoperation approaches. This is for a blog post, not a formal paper.---
+A personal benchmark experiment comparing three robot data collection setups across three manipulation tasks. The goal is to verify intuitions about the trade-offs between different teleoperation approaches. This is for a blog post, not a formal paper.
 
-## Data Collection Methods
+## Data Collection Setups
 
 ### 1. Phone Teleop
 
@@ -27,16 +27,23 @@ A personal benchmark experiment comparing three robot data collection methods ac
 - Human hand occludes top/front cameras (may be constrained to wrist cam only)
 - Follower motors too stiff for direct guidance, so still need leader arm hardware
 - Annoying setup: must swap "leader" with "follower" when switching between data collection and inference
+- Does not work with rigid grippers, only with soft grippers
 
 ---
 
 ## Tasks
 
-| Task | Description | Success Criteria ||------|-------------|------------------|| **Pick and Place Cube** | Standard manipulation benchmark | TBD || **Press Up Arrow on GBA** | Precision task; load Pokemon, press up | Character moves upward || **Throw Ping-Pong Ball into Basket** | Dynamic/reactive task requiring timing | TBD |---
+| Task                                 | Description                            | Success Criteria       |
+| ------------------------------------ | -------------------------------------- | ---------------------- |
+| **Pick and Place Cube**              | Standard manipulation benchmark        | TBD                    |
+| **Press Up Arrow on GBA**            | Precision task; load Pokemon, press up | Character moves upward |
+| **Throw Ping-Pong Ball into Basket** | Dynamic/reactive task requiring timing | TBD                    |
+
+---
 
 ## Camera Setup
 
-- **Cameras used**: Top camera + Wrist camera (for all methods)
+- **Cameras used**: Top camera + Wrist camera (for all setups)
 - **Hand-guided ablation**: Train separate models with and without top camera to measure impact of human hand occlusion
 
 ---
@@ -45,11 +52,15 @@ A personal benchmark experiment comparing three robot data collection methods ac
 
 ### Data Collection
 
-**Warm-up demos per condition**: 10 (discarded)**Recorded demos per condition**: 50**Total conditions**: 3 methods × 3 tasks = 9**Total demonstrations collected**: 540 (90 warm-up + 450 recorded)
+**Time per condition**: 15 minutes (following UMI paper approach)
+**Total conditions**: 3 setups × 3 tasks = 9
+**Total collection time**: 9 × 15 min = 135 min (2h 15min)
+
+This time-based approach (vs. fixed episode count) naturally captures the efficiency differences between setups. Some setups may yield more episodes in 15 minutes than others.
 
 ```mermaid
 graph LR
-    subgraph methods [Methods]
+    subgraph setups [Setups]
         Phone[Phone Teleop]
         Leader[Leader Teleop]
         Hand[Hand-Guided]
@@ -74,30 +85,52 @@ graph LR
 
 ### Learning Effects Mitigation
 
-**Why randomization isn't feasible**: Switching to/from hand-guided method requires physically swapping the leader and follower arms. Randomizing task/method order would mean constant hardware reconfiguration.**Mitigations**:
+**Why randomization isn't feasible**: Switching to/from hand-guided setup requires physically swapping the leader and follower arms. Randomizing task/setup order would mean constant hardware reconfiguration.
 
-1. **Prior experience**: Operator already has experience with all three methods, reducing "first-time" learning effects
-2. **Warm-up demos**: 10 warm-up demonstrations per condition, discarded before collecting the 50 recorded demos. This allows re-acclimation to each method/task combination.
+**Mitigations**:
+
+1. **Prior experience**: Operator already has experience with all three setups, reducing "first-time" learning effects
 
 **Acknowledged limitation**: Results may still reflect some ordering effects depending on collection sequence.
 
 ### Model Training
 
-**Architecture**: ACT (possibly SmolVLA, but most likely ACT)| Method | Camera Config | Models per Task ||--------|---------------|-----------------|| Phone Teleop | Top + Wrist | 1 || Leader Teleop | Top + Wrist | 1 || Hand-Guided | Top + Wrist | 1 || Hand-Guided | Wrist only | 1 |**Total models**: 3 tasks × (3 + 1 ablation) = **12 models**
+**Architecture**: ACT (possibly SmolVLA, but most likely ACT)
+
+| Setup         | Camera Config | Models per Task |
+| ------------- | ------------- | --------------- |
+| Phone Teleop  | Top + Wrist   | 1               |
+| Leader Teleop | Top + Wrist   | 1               |
+| Hand-Guided   | Top + Wrist   | 1               |
+| Hand-Guided   | Wrist only    | 1               |
+
+**Total models**: 3 tasks × (3 + 1 ablation) = **12 models**
 
 ### Evaluation
 
-**Episodes per model**: 20**Total evaluation episodes**: 12 models × 20 episodes = **240 episodes**---
+**Episodes per model**: 20
+**Total evaluation episodes**: 12 models × 20 episodes = **240 episodes**
+
+---
 
 ## Metrics
 
 ### Data Collection Metrics
 
-| Metric | Description ||--------|-------------|| **Total data collection time** | Wall-clock time to collect 50 demos || **Total dataset length** | Actual usable data (excludes mistakes/failures) || **Total mistakes** | Count of failed attempts, restarts, errors || **Qualitative impressions** | Subjective notes from the collector |
+| Metric                      | Description                                     |
+| --------------------------- | ----------------------------------------------- |
+| **Episodes collected**      | Number of episodes recorded in 15 minutes       |
+| **Total dataset length**    | Actual usable data (excludes mistakes/failures) |
+| **Total mistakes**          | Count of failed attempts, restarts, errors      |
+| **Qualitative impressions** | Subjective notes from the collector             |
 
 ### Model Evaluation Metrics
 
-| Metric | Description ||--------|-------------|| **Success rate** | % of 20 eval episodes that meet success criteria |---
+| Metric           | Description                                      |
+| ---------------- | ------------------------------------------------ |
+| **Success rate** | % of 20 eval episodes that meet success criteria |
+
+---
 
 ## Hypotheses to Verify
 
