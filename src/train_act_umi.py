@@ -28,12 +28,18 @@ Usage:
         --dataset.repo_id=giacomoran/cube_hand_guided \
         --policy.chunk_size=50 \
         --steps=50000 \
-        --batch_size=8
+        --batch_size=8 \
+        --wandb.enable=true
+
+Training with wrist camera only:
+    python src/train_act_umi.py \
+        --dataset.repo_id=giacomoran/cube_hand_guided \
+        --policy.input_features='{"observation.images.wrist": {"type": "VISUAL", "shape": [3, 480, 640]}, "observation.state": {"type": "STATE", "shape": [6]}}'
 """
 
 import logging
+import os
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from pprint import pformat
@@ -41,8 +47,8 @@ from typing import Any
 
 import draccus
 import torch
-from lerobot.configs.default import DatasetConfig
-from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.configs.default import DatasetConfig, WandBConfig
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.transforms import ImageTransforms
@@ -62,6 +68,69 @@ from torch.optim import Optimizer
 from act_umi import ACTUMIConfig, ACTUMIPolicy, make_act_umi_pre_post_processors
 
 
+class WandBLogger:
+    """A helper class to log training metrics to wandb."""
+
+    def __init__(self, cfg: "TrainACTUMIConfig"):
+        self.cfg = cfg.wandb
+        self.log_dir = cfg.output_dir
+        self.job_name = cfg.job_name
+
+        # Set up WandB.
+        os.environ["WANDB_SILENT"] = "True"
+        import wandb
+
+        self._wandb = wandb
+
+        # Build tags
+        tags = [
+            "policy:act_umi",
+            f"seed:{cfg.seed}",
+            f"dataset:{cfg.dataset.repo_id}",
+        ]
+
+        wandb.init(
+            id=self.cfg.run_id,
+            project=self.cfg.project,
+            entity=self.cfg.entity,
+            name=self.job_name,
+            notes=self.cfg.notes,
+            tags=tags,
+            dir=self.log_dir,
+            config=draccus.encode(cfg),
+            save_code=False,
+            job_type="train",
+            mode=self.cfg.mode
+            if self.cfg.mode in ["online", "offline", "disabled"]
+            else "online",
+        )
+
+        # Store run_id for resumption
+        cfg.wandb.run_id = wandb.run.id
+
+        logging.info(f"WandB initialized. Track this run --> {wandb.run.get_url()}")
+
+    def log_dict(self, d: dict, step: int, mode: str = "train"):
+        """Log a dictionary of metrics."""
+        for k, v in d.items():
+            if isinstance(v, (int, float, str)):
+                self._wandb.log({f"{mode}/{k}": v}, step=step)
+
+    def log_policy(self, checkpoint_dir: Path):
+        """Log policy checkpoint as artifact."""
+        if self.cfg.disable_artifact:
+            return
+        step_id = checkpoint_dir.name
+        artifact_name = f"act_umi-{self.job_name or 'model'}-{step_id}".replace(
+            "/", "_"
+        ).replace(":", "_")
+        artifact = self._wandb.Artifact(artifact_name, type="model")
+        pretrained_dir = checkpoint_dir / "pretrained_model"
+        if pretrained_dir.exists():
+            artifact.add_dir(str(pretrained_dir))
+            self._wandb.log_artifact(artifact)
+
+
 @dataclass
 class TrainACTUMIConfig:
     """Configuration for training ACT with Relative Joint Positions (UMI-style)."""
@@ -71,6 +140,9 @@ class TrainACTUMIConfig:
 
     # Policy configuration (will be populated from dataset)
     policy: ACTUMIConfig = field(default_factory=ACTUMIConfig)
+
+    # WandB configuration
+    wandb: WandBConfig = field(default_factory=WandBConfig)
 
     # Training configuration
     steps: int = 50000
@@ -83,6 +155,7 @@ class TrainACTUMIConfig:
 
     # Logging and checkpointing
     output_dir: Path = Path("outputs/train_act_umi")
+    job_name: str | None = None
     log_freq: int = 100
     save_freq: int = 5000
 
@@ -157,33 +230,47 @@ def make_policy_from_dataset(
     cfg: TrainACTUMIConfig,
     ds_meta: LeRobotDatasetMetadata,
 ) -> ACTUMIPolicy:
-    """Creates an ACTUMIPolicy configured from dataset metadata."""
+    """Creates an ACTUMIPolicy configured from dataset metadata.
 
-    # Build input features from dataset
-    input_features = {}
+    If cfg.policy.input_features is already set (e.g., via CLI), it will be used.
+    Otherwise, input features are inferred from the dataset metadata.
+    This allows training with a subset of cameras (e.g., wrist camera only).
+    """
+
+    # Check if input_features was already provided via CLI
+    if cfg.policy.input_features:
+        input_features = cfg.policy.input_features
+        logging.info(
+            "Using user-provided input_features (e.g., for single-camera training)"
+        )
+    else:
+        # Build input features from dataset
+        input_features = {}
+        for key, ft_meta in ds_meta.features.items():
+            if key == OBS_STATE:
+                # Note: The shape here is the base shape (state_dim),
+                # not the stacked shape (2, state_dim)
+                input_features[key] = PolicyFeature(
+                    type=FeatureType.STATE,
+                    shape=ft_meta["shape"],
+                )
+            elif key.startswith("observation.images."):
+                input_features[key] = PolicyFeature(
+                    type=FeatureType.VISUAL,
+                    shape=ft_meta["shape"],
+                )
+            elif key.startswith("observation.environment_state"):
+                input_features[key] = PolicyFeature(
+                    type=FeatureType.ENV,
+                    shape=ft_meta["shape"],
+                )
+
+    # Build output features from dataset
     output_features = {}
-
     for key, ft_meta in ds_meta.features.items():
         if key == ACTION:
             output_features[key] = PolicyFeature(
                 type=FeatureType.ACTION,
-                shape=ft_meta["shape"],
-            )
-        elif key == OBS_STATE:
-            # Note: The shape here is the base shape (state_dim),
-            # not the stacked shape (2, state_dim)
-            input_features[key] = PolicyFeature(
-                type=FeatureType.STATE,
-                shape=ft_meta["shape"],
-            )
-        elif key.startswith("observation.images."):
-            input_features[key] = PolicyFeature(
-                type=FeatureType.VISUAL,
-                shape=ft_meta["shape"],
-            )
-        elif key.startswith("observation.environment_state"):
-            input_features[key] = PolicyFeature(
-                type=FeatureType.ENV,
                 shape=ft_meta["shape"],
             )
 
@@ -253,6 +340,10 @@ def train(cfg: TrainACTUMIConfig):
 
     device = torch.device(cfg.device)
     logging.info(f"Using device: {device}")
+
+    # Set default job_name if not provided
+    if cfg.job_name is None:
+        cfg.job_name = f"act_umi_{cfg.dataset.repo_id.split('/')[-1]}"
 
     # Create output directory
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -346,6 +437,11 @@ def train(cfg: TrainACTUMIConfig):
         initial_step=0,
     )
 
+    # Initialize WandB if enabled
+    wandb_logger = None
+    if cfg.wandb.enable:
+        wandb_logger = WandBLogger(cfg)
+
     logging.info("Starting training")
 
     for step in range(cfg.steps):
@@ -373,6 +469,14 @@ def train(cfg: TrainACTUMIConfig):
             if cfg.policy.use_vae:
                 logging.info(f"  kld_loss: {output_dict.get('kld_loss', 0):.4f}")
 
+            # Log to WandB
+            if wandb_logger:
+                wandb_log_dict = train_tracker.to_dict()
+                # Add extra metrics from output_dict
+                if cfg.policy.use_vae and "kld_loss" in output_dict:
+                    wandb_log_dict["kld_loss"] = output_dict["kld_loss"]
+                wandb_logger.log_dict(wandb_log_dict, step)
+
         # Checkpointing
         if (step + 1) % cfg.save_freq == 0 or (step + 1) == cfg.steps:
             checkpoint_dir = get_step_checkpoint_dir(
@@ -386,6 +490,10 @@ def train(cfg: TrainACTUMIConfig):
             save_training_state(checkpoint_dir, step + 1, optimizer, lr_scheduler)
             update_last_checkpoint(checkpoint_dir)
             logging.info(f"Saved checkpoint to {checkpoint_dir}")
+
+            # Log checkpoint to WandB
+            if wandb_logger:
+                wandb_logger.log_policy(checkpoint_dir)
 
     logging.info("Training complete!")
     logging.info(f"Final checkpoint saved to {cfg.output_dir}")
