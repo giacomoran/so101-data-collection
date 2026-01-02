@@ -480,40 +480,50 @@ def train(cfg: TrainACTUMIConfig):
         # Load policy weights (includes relative_stats buffers)
         load_policy_weights_from_checkpoint(policy, last_checkpoint_dir)
 
-        # Verify that freshly computed stats match the checkpoint's stats
-        # (they should be identical since the dataset hasn't changed)
-        checkpoint_stats = {
-            "delta_obs": {
-                "mean": policy.delta_obs_mean.cpu().numpy(),
-                "std": policy.delta_obs_std.cpu().numpy(),
-            },
-            "relative_action": {
-                "mean": policy.relative_action_mean.cpu().numpy(),
-                "std": policy.relative_action_std.cpu().numpy(),
-            },
-        }
+        # Verify that relative stats were loaded from checkpoint
+        if not policy.has_relative_stats:
+            logging.warning(
+                "Checkpoint does not contain relative stats buffers. "
+                "This may be an older checkpoint trained without stats normalization."
+            )
+            # Set stats from freshly computed values
+            policy.set_relative_stats(relative_stats)
+            logging.info("Set relative stats from freshly computed values.")
+        else:
+            # Verify that freshly computed stats match the checkpoint's stats
+            # (they should be identical since the dataset hasn't changed)
+            checkpoint_stats = {
+                "delta_obs": {
+                    "mean": policy.delta_obs_mean.cpu().numpy(),
+                    "std": policy.delta_obs_std.cpu().numpy(),
+                },
+                "relative_action": {
+                    "mean": policy.relative_action_mean.cpu().numpy(),
+                    "std": policy.relative_action_std.cpu().numpy(),
+                },
+            }
 
-        # Compare with freshly computed stats
-        tolerance = 1e-5
-        for key in ["delta_obs", "relative_action"]:
-            for stat in ["mean", "std"]:
-                checkpoint_val = checkpoint_stats[key][stat]
-                computed_val = relative_stats[key][stat]
-                if not np.allclose(
-                    checkpoint_val, computed_val, atol=tolerance, rtol=tolerance
-                ):
-                    max_diff = np.abs(checkpoint_val - computed_val).max()
-                    logging.warning(
-                        f"Relative stats mismatch for {key}.{stat}! "
-                        f"Max diff: {max_diff:.2e}. This suggests the dataset has changed "
-                        f"or stats computation is non-deterministic."
-                    )
-                    raise ValueError(
-                        f"Stats mismatch detected. Checkpoint {key}.{stat} differs from "
-                        f"freshly computed stats by up to {max_diff:.2e} (tolerance: {tolerance:.2e})"
-                    )
+            # Compare with freshly computed stats
+            tolerance = 1e-5
+            for key in ["delta_obs", "relative_action"]:
+                for stat in ["mean", "std"]:
+                    checkpoint_val = checkpoint_stats[key][stat]
+                    computed_val = relative_stats[key][stat]
+                    if not np.allclose(
+                        checkpoint_val, computed_val, atol=tolerance, rtol=tolerance
+                    ):
+                        max_diff = np.abs(checkpoint_val - computed_val).max()
+                        logging.warning(
+                            f"Relative stats mismatch for {key}.{stat}! "
+                            f"Max diff: {max_diff:.2e}. This suggests the dataset has changed "
+                            f"or stats computation is non-deterministic."
+                        )
+                        raise ValueError(
+                            f"Stats mismatch detected. Checkpoint {key}.{stat} differs from "
+                            f"freshly computed stats by up to {max_diff:.2e} (tolerance: {tolerance:.2e})"
+                        )
 
-        logging.info("Verified: checkpoint stats match freshly computed stats ✓")
+            logging.info("Verified: checkpoint stats match freshly computed stats ✓")
 
         policy = policy.to(device)  # Move to device after loading weights
 
