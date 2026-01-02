@@ -168,13 +168,23 @@ def load_policy_from_path(
             logging.info(f"Loaded {policy_type} policy from {path}")
             return policy, policy_type
     else:
-        # HuggingFace repo ID - use from_pretrained
-        from lerobot.configs.policies import PreTrainedConfig
+        # HuggingFace repo ID - download config to determine policy type
+        from huggingface_hub import hf_hub_download
 
-        # Load config once to determine policy type
-        # Use a temporary device to avoid warnings during type detection
-        temp_config = PreTrainedConfig.from_pretrained(pretrained_name_or_path)
-        policy_type = temp_config.type
+        # Download config.json to determine policy type
+        config_file = hf_hub_download(
+            repo_id=pretrained_name_or_path,
+            filename="config.json",
+        )
+
+        with open(config_file) as f:
+            config_dict = json.load(f)
+
+        policy_type = config_dict.get("type", None)
+        if policy_type is None:
+            raise ValueError(
+                f"Config from {pretrained_name_or_path} missing 'type' field"
+            )
 
         if policy_type == "act_umi":
             # For act_umi, use from_pretrained but override device after
