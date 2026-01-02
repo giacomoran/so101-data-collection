@@ -11,10 +11,11 @@
 from .configuration_act_umi import ACTUMIConfig
 from .modeling_act_umi import ACTUMIPolicy
 from .processor_act_umi import make_act_umi_pre_post_processors
+from .relative_stats import compute_relative_stats
 
 __all__ = [
     "ACTUMIConfig",
     "ACTUMIPolicy",
+    "compute_relative_stats",
     "make_act_umi_pre_post_processors",
 ]
-

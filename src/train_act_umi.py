@@ -46,6 +46,7 @@ from pprint import pformat
 from typing import Any
 
 import draccus
+import numpy as np
 import torch
 from lerobot.configs.default import DatasetConfig, WandBConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
@@ -53,19 +54,32 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetad
 from lerobot.datasets.sampler import EpisodeAwareSampler
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.utils import cycle
-from lerobot.utils.constants import ACTION, OBS_PREFIX, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    CHECKPOINTS_DIR,
+    LAST_CHECKPOINT_LINK,
+    OBS_PREFIX,
+    OBS_STATE,
+)
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.train_utils import (
     get_step_checkpoint_dir,
+    load_training_state,
     save_training_state,
     update_last_checkpoint,
 )
 from lerobot.utils.utils import format_big_number, init_logging
+from safetensors.torch import load_file
 from torch.optim import Optimizer
 
 # Import our ACT UMI policy
-from act_umi import ACTUMIConfig, ACTUMIPolicy, make_act_umi_pre_post_processors
+from act_umi import (
+    ACTUMIConfig,
+    ACTUMIPolicy,
+    compute_relative_stats,
+    make_act_umi_pre_post_processors,
+)
 
 
 class WandBLogger:
@@ -164,6 +178,62 @@ class TrainACTUMIConfig:
 
     # Device
     device: str | None = None
+
+    # Resume from checkpoint
+    resume: bool = False
+
+
+def get_last_checkpoint_dir(output_dir: Path) -> Path | None:
+    """Get the last checkpoint directory if it exists."""
+    last_checkpoint = output_dir / CHECKPOINTS_DIR / LAST_CHECKPOINT_LINK
+    if last_checkpoint.exists():
+        # Resolve the symlink
+        return last_checkpoint.resolve()
+    return None
+
+
+def load_policy_weights_from_checkpoint(
+    policy: ACTUMIPolicy, checkpoint_dir: Path
+) -> None:
+    """Load policy weights from a checkpoint directory."""
+    from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+    from lerobot.utils.constants import PRETRAINED_MODEL_DIR
+
+    model_path = checkpoint_dir / PRETRAINED_MODEL_DIR / SAFETENSORS_SINGLE_FILE
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model weights not found at {model_path}")
+
+    state_dict = load_file(str(model_path))
+
+    # Check for key mismatches before loading
+    model_keys = set(policy.state_dict().keys())
+    checkpoint_keys = set(state_dict.keys())
+
+    missing_in_checkpoint = model_keys - checkpoint_keys
+    unexpected_in_checkpoint = checkpoint_keys - model_keys
+
+    if missing_in_checkpoint:
+        logging.warning(
+            f"Keys in model but NOT in checkpoint ({len(missing_in_checkpoint)}): {sorted(missing_in_checkpoint)}"
+        )
+    if unexpected_in_checkpoint:
+        logging.warning(
+            f"Keys in checkpoint but NOT in model ({len(unexpected_in_checkpoint)}): {sorted(unexpected_in_checkpoint)}"
+        )
+
+    matched_keys = model_keys & checkpoint_keys
+    logging.info(
+        f"Loading {len(matched_keys)}/{len(model_keys)} model keys from checkpoint"
+    )
+
+    if len(matched_keys) == 0:
+        raise ValueError(
+            "No matching keys between model and checkpoint! Weights won't load."
+        )
+
+    # Load with strict=False but we've already warned about mismatches
+    policy.load_state_dict(state_dict, strict=False)
+    logging.info(f"Loaded policy weights from {model_path}")
 
 
 def resolve_delta_timestamps_for_umi(
@@ -352,9 +422,22 @@ def train(cfg: TrainACTUMIConfig):
     logging.info("Creating dataset")
     dataset = make_dataset_for_umi_policy(cfg)
 
+    # Compute relative statistics for normalization (UMI-style)
+    # This computes stats on delta_obs and relative_actions rather than absolute values
+    logging.info("Computing relative statistics for normalization...")
+    relative_stats = compute_relative_stats(
+        dataset,
+        batch_size=cfg.batch_size,
+        num_workers=cfg.num_workers,
+    )
+
     # Create policy
     logging.info("Creating policy")
     policy = make_policy_from_dataset(cfg, dataset.meta)
+
+    # Set relative stats before moving to device (buffers will be registered)
+    policy.set_relative_stats(relative_stats)
+
     policy = policy.to(device)
 
     # Create preprocessor for training
@@ -364,15 +447,81 @@ def train(cfg: TrainACTUMIConfig):
     )
 
     # Create optimizer and scheduler
+    # Match lerobot's ACT training pattern: use policy.get_optim_params() which returns
+    # param groups with explicit lr values (base lr for non-backbone, lr_backbone for backbone)
     logging.info("Creating optimizer")
     from torch.optim import AdamW
 
+    # Get param groups from policy (already includes explicit lr for each group)
+    param_groups = policy.get_optim_params()
+
+    # Create optimizer - lr and weight_decay here are defaults for groups without explicit values
+    # Since get_optim_params() already sets explicit lr for each group, these defaults won't override
+    # but are kept for consistency with lerobot's pattern
     optimizer = AdamW(
-        policy.get_optim_params(),
-        lr=cfg.policy.optimizer_lr,
+        param_groups,
+        lr=cfg.policy.optimizer_lr,  # Default lr (used if param groups don't specify)
         weight_decay=cfg.policy.optimizer_weight_decay,
+        betas=(0.9, 0.999),
+        eps=1e-8,
     )
     lr_scheduler = None
+
+    # Handle resume from checkpoint
+    start_step = 0
+    if cfg.resume:
+        last_checkpoint_dir = get_last_checkpoint_dir(cfg.output_dir)
+        if last_checkpoint_dir is None:
+            raise ValueError(
+                f"--resume was set but no checkpoint found in {cfg.output_dir / CHECKPOINTS_DIR}"
+            )
+        logging.info(f"Resuming from checkpoint: {last_checkpoint_dir}")
+
+        # Load policy weights (includes relative_stats buffers)
+        load_policy_weights_from_checkpoint(policy, last_checkpoint_dir)
+
+        # Verify that freshly computed stats match the checkpoint's stats
+        # (they should be identical since the dataset hasn't changed)
+        checkpoint_stats = {
+            "delta_obs": {
+                "mean": policy.delta_obs_mean.cpu().numpy(),
+                "std": policy.delta_obs_std.cpu().numpy(),
+            },
+            "relative_action": {
+                "mean": policy.relative_action_mean.cpu().numpy(),
+                "std": policy.relative_action_std.cpu().numpy(),
+            },
+        }
+
+        # Compare with freshly computed stats
+        tolerance = 1e-5
+        for key in ["delta_obs", "relative_action"]:
+            for stat in ["mean", "std"]:
+                checkpoint_val = checkpoint_stats[key][stat]
+                computed_val = relative_stats[key][stat]
+                if not np.allclose(
+                    checkpoint_val, computed_val, atol=tolerance, rtol=tolerance
+                ):
+                    max_diff = np.abs(checkpoint_val - computed_val).max()
+                    logging.warning(
+                        f"Relative stats mismatch for {key}.{stat}! "
+                        f"Max diff: {max_diff:.2e}. This suggests the dataset has changed "
+                        f"or stats computation is non-deterministic."
+                    )
+                    raise ValueError(
+                        f"Stats mismatch detected. Checkpoint {key}.{stat} differs from "
+                        f"freshly computed stats by up to {max_diff:.2e} (tolerance: {tolerance:.2e})"
+                    )
+
+        logging.info("Verified: checkpoint stats match freshly computed stats ✓")
+
+        policy = policy.to(device)  # Move to device after loading weights
+
+        # Load training state (optimizer, rng, step)
+        start_step, optimizer, lr_scheduler = load_training_state(
+            last_checkpoint_dir, optimizer, lr_scheduler
+        )
+        logging.info(f"Resumed training from step {start_step}")
 
     num_learnable_params = sum(
         p.numel() for p in policy.parameters() if p.requires_grad
@@ -434,7 +583,7 @@ def train(cfg: TrainACTUMIConfig):
         dataset.num_frames,
         dataset.num_episodes,
         train_metrics,
-        initial_step=0,
+        initial_step=start_step,
     )
 
     # Initialize WandB if enabled
@@ -444,7 +593,7 @@ def train(cfg: TrainACTUMIConfig):
 
     logging.info("Starting training")
 
-    for step in range(cfg.steps):
+    for step in range(start_step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
         batch = preprocessor(batch)
@@ -477,6 +626,9 @@ def train(cfg: TrainACTUMIConfig):
                     wandb_log_dict["kld_loss"] = output_dict["kld_loss"]
                 wandb_logger.log_dict(wandb_log_dict, step)
 
+            # Reset averages so next log shows stats for the last log_freq steps only
+            train_tracker.reset_averages()
+
         # Checkpointing
         if (step + 1) % cfg.save_freq == 0 or (step + 1) == cfg.steps:
             checkpoint_dir = get_step_checkpoint_dir(
@@ -497,6 +649,38 @@ def train(cfg: TrainACTUMIConfig):
 
     logging.info("Training complete!")
     logging.info(f"Final checkpoint saved to {cfg.output_dir}")
+
+    # Push to HuggingFace Hub if enabled
+    if hasattr(cfg.policy, "push_to_hub") and cfg.policy.push_to_hub:
+        if not hasattr(cfg.policy, "repo_id") or not cfg.policy.repo_id:
+            logging.warning(
+                "push_to_hub is enabled but repo_id is not set. Skipping push to Hub."
+            )
+        else:
+            logging.info(f"Pushing model to HuggingFace Hub: {cfg.policy.repo_id}")
+            try:
+                # Get the final checkpoint directory
+                final_checkpoint_dir = get_step_checkpoint_dir(
+                    cfg.output_dir, cfg.steps, cfg.steps
+                )
+                pretrained_dir = final_checkpoint_dir / "pretrained_model"
+
+                if not pretrained_dir.exists():
+                    logging.warning(
+                        f"Final checkpoint not found at {pretrained_dir}. "
+                        "Saving model before pushing to Hub."
+                    )
+                    pretrained_dir.mkdir(parents=True, exist_ok=True)
+                    policy.save_pretrained(pretrained_dir)
+
+                # Push to Hub
+                policy.push_to_hub(
+                    repo_id=cfg.policy.repo_id,
+                    commit_message=f"Training completed after {cfg.steps} steps",
+                )
+                logging.info(f"Successfully pushed model to {cfg.policy.repo_id}")
+            except Exception as e:
+                logging.error(f"Failed to push model to Hub: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

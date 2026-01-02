@@ -54,15 +54,32 @@ class ACTUMIConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 1
+    n_obs_steps: int = 2
     chunk_size: int = 100
     n_action_steps: int = 100
 
+    # Normalization configuration for ACT UMI:
+    #
+    # We disable normalization for STATE and ACTION features because the model computes
+    # relative transformations from absolute values:
+    #   - Observation deltas: delta_obs = obs[t] - obs[t-1]
+    #   - Relative actions: relative_action = action - obs[t]
+    #
+    # Normalization must happen AFTER computing these relative values, not before, because:
+    #     normalize(a) - normalize(b) ≠ normalize(a - b)
+    #
+    # If we normalized absolute values first, the relative transformations would be computed
+    # on normalized data, which has different statistical properties than the true relative
+    # values. The distributions of absolute positions (mean≈0.5rad, std≈1.0rad) differ
+    # fundamentally from relative changes (mean≈0.0rad, std≈0.05rad).
+    #
+    # Images are still normalized because they don't undergo relative transformations and
+    # normalization is essential for vision backbones trained on ImageNet statistics.
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
-            "VISUAL": NormalizationMode.MEAN_STD,
-            "STATE": NormalizationMode.MEAN_STD,
-            "ACTION": NormalizationMode.MEAN_STD,
+            "VISUAL": NormalizationMode.MEAN_STD,  # Keep normalization for images
+            "STATE": NormalizationMode.IDENTITY,  # Disable: we compute deltas from absolute values
+            "ACTION": NormalizationMode.IDENTITY,  # Disable: we compute relative actions from absolute values
         }
     )
 
@@ -114,10 +131,6 @@ class ACTUMIConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
-        if self.n_obs_steps != 1:
-            raise ValueError(
-                f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
-            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -150,7 +163,7 @@ class ACTUMIConfig(PreTrainedConfig):
         - observation.state[0] = obs.state[t-1]
         - observation.state[1] = obs.state[t]
         """
-        return [-1, 0]
+        return list(range(1 - self.n_obs_steps, 1))
 
     @property
     def action_delta_indices(self) -> list:

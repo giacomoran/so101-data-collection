@@ -24,7 +24,7 @@ Key changes from standard ACT:
 - forward(): Converts absolute actions to relative before computing loss
 - forward(): Computes observation delta from obs.state[t-1] and obs.state[t]
 - select_action(): Converts predicted relative actions back to absolute
-- Stores previous observation for delta computation during inference
+- Uses queue-based observation history tracking (following lerobot conventions)
 """
 
 import math
@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
 from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
@@ -59,14 +60,17 @@ class ACTUMIPolicy(PreTrainedPolicy):
         - Predicts relative actions and computes loss
 
     Inference:
-        - Maintains previous observation state
-        - Computes delta_obs = obs[t] - obs[t-1]
+        - Maintains observation history using a queue (following lerobot conventions)
+        - Computes delta_obs = obs[t] - obs[t-1] from stacked observations
         - Predicts relative actions
         - Converts back to absolute: action = rel_action + obs[t]
     """
 
     config_class = ACTUMIConfig
     name = "act_umi"
+
+    # Epsilon for numerical stability in normalization
+    _NORM_EPS = 1e-8
 
     def __init__(
         self,
@@ -84,16 +88,31 @@ class ACTUMIPolicy(PreTrainedPolicy):
                 config.temporal_ensemble_coeff, config.chunk_size
             )
 
+        # Initialize relative stats buffers as None
+        # These will be registered by set_relative_stats() if stats are provided
+        # Using register_buffer with None allows save/load to work correctly
+        self.register_buffer("delta_obs_mean", None)
+        self.register_buffer("delta_obs_std", None)
+        self.register_buffer("relative_action_mean", None)
+        self.register_buffer("relative_action_std", None)
+
         self.reset()
 
-    def get_optim_params(self) -> dict:
+    def get_optim_params(self) -> list[dict]:
+        """Return parameter groups for optimizer with differential learning rates.
+
+        Matches lerobot's ACT policy implementation:
+        - First group: all params except backbone, uses optimizer_lr
+        - Second group: backbone params only, uses optimizer_lr_backbone
+        """
         return [
             {
                 "params": [
                     p
                     for n, p in self.named_parameters()
                     if not n.startswith("model.backbone") and p.requires_grad
-                ]
+                ],
+                "lr": self.config.optimizer_lr,
             },
             {
                 "params": [
@@ -105,14 +124,59 @@ class ACTUMIPolicy(PreTrainedPolicy):
             },
         ]
 
+    def set_relative_stats(self, stats: dict) -> None:
+        """Register relative normalization statistics as buffers.
+
+        These stats are used to normalize observation deltas and relative actions
+        in the forward pass, following the UMI approach of normalizing relative
+        values rather than absolute values.
+
+        Args:
+            stats: Dictionary with structure:
+                {
+                    "delta_obs": {"mean": np.array, "std": np.array},
+                    "relative_action": {"mean": np.array, "std": np.array}
+                }
+        """
+        # Register delta_obs stats
+        self.register_buffer(
+            "delta_obs_mean",
+            torch.tensor(stats["delta_obs"]["mean"], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "delta_obs_std",
+            torch.tensor(stats["delta_obs"]["std"], dtype=torch.float32),
+        )
+
+        # Register relative_action stats
+        self.register_buffer(
+            "relative_action_mean",
+            torch.tensor(stats["relative_action"]["mean"], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "relative_action_std",
+            torch.tensor(stats["relative_action"]["std"], dtype=torch.float32),
+        )
+
+    def _normalize(self, tensor: Tensor, mean: Tensor, std: Tensor) -> Tensor:
+        """Normalize tensor using MEAN_STD normalization."""
+        return (tensor - mean) / (std + self._NORM_EPS)
+
+    def _unnormalize(self, tensor: Tensor, mean: Tensor, std: Tensor) -> Tensor:
+        """Unnormalize tensor using MEAN_STD normalization."""
+        return tensor * std + mean
+
     def reset(self):
         """This should be called whenever the environment is reset."""
         if self.config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        # Store previous observation for delta computation during inference
-        self._prev_obs_state: Tensor | None = None
+        # Initialize observation queue for delta computation during inference
+        # Queue maintains 2 observations: [obs[t-1], obs[t]] for computing deltas
+        self._queues = {
+            OBS_STATE: deque(maxlen=2),
+        }
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -120,45 +184,68 @@ class ACTUMIPolicy(PreTrainedPolicy):
 
         During inference, the batch contains obs.state with shape [batch, state_dim]
         (single observation, not the [t-1, t] pair from training).
-        We maintain the previous observation internally.
+        We maintain observation history using queues (following lerobot conventions).
+
+        Normalization is applied if relative stats were provided via set_relative_stats().
         """
         self.eval()
 
-        # Get current observation state
-        current_obs_state = batch[OBS_STATE]  # (batch, state_dim)
+        # Populate observation queue with current observation
+        # This automatically handles initialization by copying the first observation
+        self._queues = populate_queues(self._queues, batch)
 
-        # Initialize previous observation if this is the first step
-        if self._prev_obs_state is None:
-            self._prev_obs_state = current_obs_state.clone()
+        # Stack observations from queue: [obs[t-1], obs[t]] -> (batch, 2, state_dim)
+        obs_state_stacked = torch.stack(list(self._queues[OBS_STATE]), dim=1)
+        obs_state_t_minus_1 = obs_state_stacked[:, 0, :]  # (batch, state_dim)
+        obs_state_t = obs_state_stacked[:, 1, :]  # (batch, state_dim)
 
         # Compute delta observation: obs[t] - obs[t-1]
-        delta_obs_state = current_obs_state - self._prev_obs_state  # (batch, state_dim)
+        delta_obs_state = obs_state_t - obs_state_t_minus_1  # (batch, state_dim)
 
-        # Create a modified batch with delta observation
+        # Normalize delta observation if stats are available
+        if self.delta_obs_mean is not None:
+            delta_obs_state = self._normalize(
+                delta_obs_state, self.delta_obs_mean, self.delta_obs_std
+            )
+
+        # Create a modified batch with (normalized) delta observation
         inference_batch = dict(batch)
         inference_batch[OBS_STATE] = delta_obs_state
-        # Store the current absolute state for converting relative actions back to absolute
-        inference_batch["_current_obs_state_absolute"] = current_obs_state
 
         if self.config.temporal_ensemble_coeff is not None:
-            # Predict relative actions
-            relative_actions = self.predict_action_chunk(inference_batch)
+            # Predict (normalized) relative actions
+            relative_actions_normalized = self.predict_action_chunk(inference_batch)
+            # Unnormalize if stats are available
+            if self.relative_action_mean is not None:
+                relative_actions = self._unnormalize(
+                    relative_actions_normalized,
+                    self.relative_action_mean,
+                    self.relative_action_std,
+                )
+            else:
+                relative_actions = relative_actions_normalized
             # Convert to absolute
-            absolute_actions = relative_actions + current_obs_state.unsqueeze(1)
+            absolute_actions = relative_actions + obs_state_t.unsqueeze(1)
             action = self.temporal_ensembler.update(absolute_actions)
         else:
             if len(self._action_queue) == 0:
-                # Predict relative actions
-                relative_actions = self.predict_action_chunk(inference_batch)[
-                    :, : self.config.n_action_steps
-                ]
+                # Predict (normalized) relative actions
+                relative_actions_normalized = self.predict_action_chunk(
+                    inference_batch
+                )[:, : self.config.n_action_steps]
+                # Unnormalize if stats are available
+                if self.relative_action_mean is not None:
+                    relative_actions = self._unnormalize(
+                        relative_actions_normalized,
+                        self.relative_action_mean,
+                        self.relative_action_std,
+                    )
+                else:
+                    relative_actions = relative_actions_normalized
                 # Convert to absolute
-                absolute_actions = relative_actions + current_obs_state.unsqueeze(1)
+                absolute_actions = relative_actions + obs_state_t.unsqueeze(1)
                 self._action_queue.extend(absolute_actions.transpose(0, 1))
             action = self._action_queue.popleft()
-
-        # Update previous observation for next step
-        self._prev_obs_state = current_obs_state.clone()
 
         return action
 
@@ -190,6 +277,7 @@ class ACTUMIPolicy(PreTrainedPolicy):
         We compute:
         - delta_obs = obs[t] - obs[t-1]
         - relative_actions = action - obs[t]
+        - Normalize both using registered relative stats (if available)
         """
         # Extract obs[t-1] and obs[t] from stacked observations
         # obs.state shape: [batch, 2, state_dim]
@@ -206,7 +294,16 @@ class ACTUMIPolicy(PreTrainedPolicy):
         absolute_actions = batch[ACTION]
         relative_actions = absolute_actions - obs_state_t.unsqueeze(1)
 
-        # Create modified batch with delta observation
+        # Normalize relative values using registered buffers (if stats were provided)
+        if self.delta_obs_mean is not None:
+            delta_obs_state = self._normalize(
+                delta_obs_state, self.delta_obs_mean, self.delta_obs_std
+            )
+            relative_actions = self._normalize(
+                relative_actions, self.relative_action_mean, self.relative_action_std
+            )
+
+        # Create modified batch with (normalized) delta observation
         training_batch = dict(batch)
         training_batch[OBS_STATE] = delta_obs_state
 
@@ -218,10 +315,10 @@ class ACTUMIPolicy(PreTrainedPolicy):
                 batch[key][:, 1, :, :, :] for key in self.config.image_features
             ]
 
-        # Forward through model to get predicted relative actions
+        # Forward through model to get predicted (normalized) relative actions
         pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(training_batch)
 
-        # Compute L1 loss on relative actions
+        # Compute L1 loss on (normalized) relative actions
         l1_loss = (
             F.l1_loss(relative_actions, pred_relative_actions, reduction="none")
             * ~batch["action_is_pad"].unsqueeze(-1)

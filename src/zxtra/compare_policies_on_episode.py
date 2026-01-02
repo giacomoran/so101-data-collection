@@ -37,7 +37,6 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.utils import init_logging
-from safetensors.torch import load_model as load_model_as_safetensor
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -131,6 +130,8 @@ def load_policy_from_path(
 
         # For act_umi, use manual loading
         if policy_type == "act_umi":
+            from safetensors.torch import load_file
+
             from act_umi import ACTUMIConfig, ACTUMIPolicy
 
             config_dict.pop("type", None)
@@ -145,7 +146,11 @@ def load_policy_from_path(
             model_path = path / SAFETENSORS_SINGLE_FILE
             if not model_path.exists():
                 raise FileNotFoundError(f"Model not found at {model_path}")
-            load_model_as_safetensor(policy, str(model_path))
+
+            # Load state dict manually to handle buffers properly
+            # Use strict=False to allow loading buffers that might be None initially
+            state_dict = load_file(str(model_path))
+            policy.load_state_dict(state_dict, strict=False)
             policy = policy.to(device)
             policy.eval()
             logging.info(f"Loaded {policy_type} policy from {path}")
