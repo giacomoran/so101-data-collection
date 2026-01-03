@@ -199,10 +199,13 @@ class ACTUMIPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        # Initialize observation queue for delta computation during inference
-        # Queue maintains 2 observations: [obs[t-1], obs[t]] for computing deltas
+        # Initialize observation queue for delta computation during inference.
+        # Queue maintains obs_state_delta_frames + 1 observations to compute:
+        #   delta_obs = obs[t] - obs[t - obs_state_delta_frames]
+        # We store the full history and use first/last elements.
+        queue_size = self.config.obs_state_delta_frames + 1
         self._queues = {
-            OBS_STATE: deque(maxlen=2),
+            OBS_STATE: deque(maxlen=queue_size),
         }
 
     @torch.no_grad()
@@ -210,7 +213,7 @@ class ACTUMIPolicy(PreTrainedPolicy):
         """Select a single action given environment observations.
 
         During inference, the batch contains obs.state with shape [batch, state_dim]
-        (single observation, not the [t-1, t] pair from training).
+        (single observation, not the stacked pair from training).
         We maintain observation history using queues (following lerobot conventions).
 
         Normalization is applied if relative stats were provided via set_relative_stats().
@@ -221,13 +224,15 @@ class ACTUMIPolicy(PreTrainedPolicy):
         # This automatically handles initialization by copying the first observation
         self._queues = populate_queues(self._queues, batch)
 
-        # Stack observations from queue: [obs[t-1], obs[t]] -> (batch, 2, state_dim)
-        obs_state_stacked = torch.stack(list(self._queues[OBS_STATE]), dim=1)
-        obs_state_t_minus_1 = obs_state_stacked[:, 0, :]  # (batch, state_dim)
-        obs_state_t = obs_state_stacked[:, 1, :]  # (batch, state_dim)
+        # Get observations for delta computation
+        # Queue contains: [obs[t-N], obs[t-N+1], ..., obs[t]]
+        # We use first (oldest) and last (current) for delta
+        obs_queue = list(self._queues[OBS_STATE])
+        obs_state_t_minus_n = obs_queue[0]  # (batch, state_dim) - oldest in queue
+        obs_state_t = obs_queue[-1]  # (batch, state_dim) - current
 
-        # Compute delta observation: obs[t] - obs[t-1]
-        delta_obs_state = obs_state_t - obs_state_t_minus_1  # (batch, state_dim)
+        # Compute delta observation: obs[t] - obs[t - obs_state_delta_frames]
+        delta_obs_state = obs_state_t - obs_state_t_minus_n  # (batch, state_dim)
 
         # Normalize delta observation if stats are available
         if self.has_relative_stats:
@@ -277,13 +282,9 @@ class ACTUMIPolicy(PreTrainedPolicy):
 
         if self.config.image_features:
             batch = dict(batch)
-            # Extract only the current timestep (t=0, which is index 1 in the stacked tensor)
-            # Images have shape [batch, 2, channels, height, width] from delta_timestamps
-            # We need [batch, channels, height, width] for the backbone
-            batch[OBS_IMAGES] = [
-                batch[key][:, 1, :, :, :] if batch[key].ndim == 5 else batch[key]
-                for key in self.config.image_features
-            ]
+            # Images should have shape [batch, channels, height, width]
+            # During inference, they come directly from the robot without stacking
+            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
         actions = self.model(batch)[0]
         return actions
@@ -325,11 +326,10 @@ class ACTUMIPolicy(PreTrainedPolicy):
         training_batch[OBS_STATE] = delta_obs_state
 
         if self.config.image_features:
-            # Extract only the current timestep (t=0, which is index 1 in the stacked tensor)
-            # Images have shape [batch, 2, channels, height, width] from delta_timestamps
-            # We need [batch, channels, height, width] for the backbone
+            # Images now have shape [batch, channels, height, width] (not stacked)
+            # since we only request current frame via image_delta_indices=[0]
             training_batch[OBS_IMAGES] = [
-                batch[key][:, 1, :, :, :] for key in self.config.image_features
+                batch[key] for key in self.config.image_features
             ]
 
         # Forward through model to get predicted (normalized) relative actions

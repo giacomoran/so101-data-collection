@@ -242,8 +242,12 @@ def resolve_delta_timestamps_for_umi(
     """Resolves delta_timestamps for ACTUMIPolicy.
 
     Returns delta_timestamps that include:
-    - observation.state: [-1/fps, 0] to get obs.state[t-1] and obs.state[t]
+    - observation.state: Uses state_delta_indices (e.g., [-3/fps, 0] for obs_state_delta_frames=3)
+    - observation.images.*: Uses image_delta_indices ([0]) - only current frame needed
     - action: [0, 1/fps, 2/fps, ...] for the action chunk
+
+    This optimization avoids loading intermediate image frames that aren't used,
+    while still allowing larger state deltas for better velocity estimation.
     """
     delta_timestamps = {}
 
@@ -252,9 +256,20 @@ def resolve_delta_timestamps_for_umi(
             delta_timestamps[key] = [
                 i / ds_meta.fps for i in config.action_delta_indices
             ]
-        if key.startswith(OBS_PREFIX) and config.observation_delta_indices is not None:
+        elif key == OBS_STATE:
+            # State needs two timestamps for delta computation
             delta_timestamps[key] = [
-                i / ds_meta.fps for i in config.observation_delta_indices
+                i / ds_meta.fps for i in config.state_delta_indices
+            ]
+        elif key.startswith("observation.images."):
+            # Images only need current frame (no delta computation)
+            delta_timestamps[key] = [
+                i / ds_meta.fps for i in config.image_delta_indices
+            ]
+        elif key.startswith(OBS_PREFIX):
+            # Other observation features (e.g., environment_state) - use image indices
+            delta_timestamps[key] = [
+                i / ds_meta.fps for i in config.image_delta_indices
             ]
 
     return delta_timestamps
@@ -625,6 +640,7 @@ def train(cfg: TrainACTUMIConfig):
         # Logging
         if step % cfg.log_freq == 0:
             logging.info(train_tracker)
+            logging.info(f"  l1_loss: {output_dict.get('l1_loss', 0):.4f}")
             if cfg.policy.use_vae:
                 logging.info(f"  kld_loss: {output_dict.get('kld_loss', 0):.4f}")
 
@@ -632,6 +648,8 @@ def train(cfg: TrainACTUMIConfig):
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 # Add extra metrics from output_dict
+                if "l1_loss" in output_dict:
+                    wandb_log_dict["l1_loss"] = output_dict["l1_loss"]
                 if cfg.policy.use_vae and "kld_loss" in output_dict:
                     wandb_log_dict["kld_loss"] = output_dict["kld_loss"]
                 wandb_logger.log_dict(wandb_log_dict, step)

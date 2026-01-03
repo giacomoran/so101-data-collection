@@ -4,7 +4,8 @@
 
 This module computes normalization statistics on relative values (observation deltas
 and relative actions) rather than absolute values. This is necessary because:
-- The model computes relative transformations: delta_obs = obs[t] - obs[t-1]
+- The model computes relative transformations: delta_obs = obs[t] - obs[t-N]
+  (where N = obs_state_delta_frames, default 1)
 - Actions are relative to the current observation: rel_action = action - obs[t]
 - normalize(a) - normalize(b) ≠ normalize(a - b)
 
@@ -33,7 +34,7 @@ def compute_relative_stats(
 
     This function iterates through the dataset and computes the same relative
     transformations as the model's forward() method:
-    - delta_obs = obs[t] - obs[t-1]
+    - delta_obs = obs[t] - obs[t-N]  (where N = obs_state_delta_frames)
     - relative_actions = action - obs[t]
 
     The statistics are computed over all samples, with relative_actions flattened
@@ -41,7 +42,9 @@ def compute_relative_stats(
 
     Args:
         dataset: LeRobotDataset with delta_timestamps configured to return
-                 observation.state with shape [2, state_dim] (t-1 and t)
+                 observation.state with shape [2, state_dim] where:
+                 - index 0 = obs[t - obs_state_delta_frames]
+                 - index 1 = obs[t]
                  and action with shape [chunk_size, action_dim].
         batch_size: Batch size for iterating through the dataset.
         num_workers: Number of workers for the DataLoader.

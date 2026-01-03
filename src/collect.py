@@ -128,6 +128,15 @@ TASK_DESCRIPTIONS = {
     Task.BALL: "Throw the ping-pong ball into the basket",
 }
 
+# Task-specific FPS recommendations (based on UMI paper and task dynamics)
+# Quasi-static tasks (pick-and-place, manipulation) use 10Hz
+# Dynamic tasks (throwing, catching) use 20Hz
+TASK_FPS = {
+    Task.CUBE: 10,  # Quasi-static manipulation
+    Task.GBA: 10,  # Quasi-static button pressing
+    Task.BALL: 20,  # Dynamic throwing motion
+}
+
 
 @dataclass
 class CollectConfig:
@@ -838,6 +847,11 @@ def parse_args() -> CollectConfig:
         help="Data collection setup",
     )
 
+    # Parse task first to determine task-specific FPS default
+    args, remaining_args = parser.parse_known_args()
+    task = Task(args.task)
+    task_fps = TASK_FPS.get(task, DEFAULT_FPS)
+
     # Collection mode: either --num-episodes (regular) or --benchmark (time-capped)
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -863,8 +877,9 @@ def parse_args() -> CollectConfig:
     parser.add_argument(
         "--fps",
         type=int,
-        default=DEFAULT_FPS,
-        help="Recording FPS",
+        default=task_fps,
+        help=f"Recording FPS (default: {task_fps} for {task.value} task, "
+        f"based on task dynamics - quasi-static tasks use 10Hz, dynamic tasks use 20Hz)",
     )
     parser.add_argument(
         "--episode-time",
@@ -943,7 +958,8 @@ def parse_args() -> CollectConfig:
         help="Resume recording on an existing dataset (incompatible with --benchmark)",
     )
 
-    args = parser.parse_args()
+    # Parse all arguments (including those added after initial parse_known_args)
+    args = parser.parse_args(remaining_args, namespace=args)
 
     # Determine mode: benchmark or regular
     if args.benchmark is not None:

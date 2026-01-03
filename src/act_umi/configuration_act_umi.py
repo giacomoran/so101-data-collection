@@ -54,9 +54,16 @@ class ACTUMIConfig(PreTrainedConfig):
     """
 
     # Input / output structure.
-    n_obs_steps: int = 2
+    n_obs_steps: int = 2  # Kept for backward compatibility, but see obs_state_delta_frames
     chunk_size: int = 100
     n_action_steps: int = 100
+
+    # Number of frames back for computing observation state delta.
+    # delta_obs = obs.state[t] - obs.state[t - obs_state_delta_frames]
+    # Default=1 means delta over 1 frame (33ms at 30Hz).
+    # Use obs_state_delta_frames=3 for delta over 3 frames (100ms at 30Hz, ~10Hz effective).
+    # Higher values give larger, more meaningful deltas when data is high-frequency.
+    obs_state_delta_frames: int = 1
 
     # Normalization configuration for ACT UMI:
     #
@@ -153,17 +160,34 @@ class ACTUMIConfig(PreTrainedConfig):
             )
 
     @property
-    def observation_delta_indices(self) -> list[int]:
-        """Return indices for fetching obs.state[t-1] and obs.state[t].
+    def state_delta_indices(self) -> list[int]:
+        """Return indices for fetching obs.state[t-N] and obs.state[t].
 
-        Index -1 means one frame before the current frame.
-        Index 0 means the current frame.
+        Uses obs_state_delta_frames to determine N.
+        Example with obs_state_delta_frames=3: returns [-3, 0]
 
         The dataset will return observation.state with shape [2, state_dim]:
-        - observation.state[0] = obs.state[t-1]
+        - observation.state[0] = obs.state[t - obs_state_delta_frames]
         - observation.state[1] = obs.state[t]
         """
-        return list(range(1 - self.n_obs_steps, 1))
+        return [-self.obs_state_delta_frames, 0]
+
+    @property
+    def image_delta_indices(self) -> list[int]:
+        """Return indices for fetching images.
+
+        We only need the current frame for images (no delta computation).
+        This saves memory by not loading intermediate frames.
+        """
+        return [0]
+
+    @property
+    def observation_delta_indices(self) -> list[int]:
+        """Backward compatibility - returns state_delta_indices.
+
+        Note: Use state_delta_indices and image_delta_indices for new code.
+        """
+        return self.state_delta_indices
 
     @property
     def action_delta_indices(self) -> list:
