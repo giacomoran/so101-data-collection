@@ -494,12 +494,12 @@ def train(cfg: TrainACTUMIConfig):
             # (they should be identical since the dataset hasn't changed)
             checkpoint_stats = {
                 "delta_obs": {
-                    "mean": policy.delta_obs_mean.cpu().numpy(),
-                    "std": policy.delta_obs_std.cpu().numpy(),
+                    "mean": policy.delta_obs_normalizer.mean.cpu().numpy(),
+                    "std": policy.delta_obs_normalizer.std.cpu().numpy(),
                 },
                 "relative_action": {
-                    "mean": policy.relative_action_mean.cpu().numpy(),
-                    "std": policy.relative_action_std.cpu().numpy(),
+                    "mean": policy.relative_action_normalizer.mean.cpu().numpy(),
+                    "std": policy.relative_action_normalizer.std.cpu().numpy(),
                 },
             }
 
@@ -682,12 +682,17 @@ def train(cfg: TrainACTUMIConfig):
                     )
                     pretrained_dir.mkdir(parents=True, exist_ok=True)
                     policy.save_pretrained(pretrained_dir)
+                    preprocessor.save_pretrained(pretrained_dir)
+                    postprocessor.save_pretrained(pretrained_dir)
 
-                # Push to Hub
+                # Push model to Hub
                 policy.push_to_hub(
                     repo_id=cfg.policy.repo_id,
                     commit_message=f"Training completed after {cfg.steps} steps",
                 )
+                # Push preprocessor and postprocessor (contain normalization stats)
+                preprocessor.push_to_hub(cfg.policy.repo_id)
+                postprocessor.push_to_hub(cfg.policy.repo_id)
                 logging.info(f"Successfully pushed model to {cfg.policy.repo_id}")
             except Exception as e:
                 logging.error(f"Failed to push model to Hub: {e}", exc_info=True)

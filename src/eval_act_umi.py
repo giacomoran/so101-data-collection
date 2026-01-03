@@ -97,8 +97,8 @@ def get_device(device: str | None) -> torch.device:
 def load_actumi_policy(repo_id: str, device: torch.device) -> ACTUMIPolicy:
     """Load ACTUMI policy from HuggingFace Hub.
 
-    Note: The policy's relative stats (delta_obs_mean/std, relative_action_mean/std)
-    are stored as model buffers and loaded automatically with the weights.
+    Note: The policy's relative stats are stored in Normalizer submodules
+    (delta_obs_normalizer, relative_action_normalizer) and loaded automatically.
     Image normalization is handled separately using ImageNet stats.
 
     Returns:

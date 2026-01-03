@@ -47,6 +47,46 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 from .configuration_act_umi import ACTUMIConfig
 
 
+class Normalizer(nn.Module):
+    """Affine normalization module with persistent mean/std buffers.
+
+    This is the idiomatic PyTorch pattern for normalization statistics:
+    - Buffers are always registered in __init__ with identity transform defaults
+    - They serialize properly to state_dict (no None values)
+    - No custom load_state_dict() needed
+    - Clean encapsulation of normalize/unnormalize operations
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+        # Always register buffers with identity transform defaults (mean=0, std=1)
+        # This ensures they're always in state_dict and serialize properly
+        self.register_buffer("mean", torch.zeros(dim, dtype=torch.float32))
+        self.register_buffer("std", torch.ones(dim, dtype=torch.float32))
+        # Track whether stats have been configured (also serialized)
+        self.register_buffer("_is_configured", torch.tensor(False))
+
+    @property
+    def is_configured(self) -> bool:
+        """Check if normalization statistics have been set."""
+        return self._is_configured.item()
+
+    def configure(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Set normalization statistics. Call once after computing stats from data."""
+        self.mean.copy_(mean.to(dtype=torch.float32))
+        self.std.copy_(std.to(dtype=torch.float32))
+        self._is_configured.fill_(True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Normalize: (x - mean) / (std + eps)"""
+        return (x - self.mean) / (self.std + self.eps)
+
+    def inverse(self, x: Tensor) -> Tensor:
+        """Unnormalize: x * std + mean"""
+        return x * self.std + self.mean
+
+
 class ACTUMIPolicy(PreTrainedPolicy):
     """ACT Policy with Relative Joint Positions.
 
@@ -69,9 +109,6 @@ class ACTUMIPolicy(PreTrainedPolicy):
     config_class = ACTUMIConfig
     name = "act_umi"
 
-    # Epsilon for numerical stability in normalization
-    _NORM_EPS = 1e-8
-
     def __init__(
         self,
         config: ACTUMIConfig,
@@ -88,9 +125,14 @@ class ACTUMIPolicy(PreTrainedPolicy):
                 config.temporal_ensemble_coeff, config.chunk_size
             )
 
-        # Relative stats buffers will be registered by set_relative_stats() when provided.
-        # We don't pre-register None buffers since PyTorch excludes them from state_dict().
-        # Use has_relative_stats property to check if they're set.
+        # Normalizers for relative values (delta_obs and relative_actions)
+        # These are proper nn.Modules with persistent buffers that serialize correctly.
+        # They start with identity transform (mean=0, std=1) and are configured via
+        # set_relative_stats() or loaded from checkpoint automatically.
+        state_dim = config.robot_state_feature.shape[0]
+        action_dim = config.action_feature.shape[0]
+        self.delta_obs_normalizer = Normalizer(state_dim)
+        self.relative_action_normalizer = Normalizer(action_dim)
 
         self.reset()
 
@@ -122,16 +164,14 @@ class ACTUMIPolicy(PreTrainedPolicy):
 
     @property
     def has_relative_stats(self) -> bool:
-        """Check if relative stats buffers are registered and set."""
+        """Check if relative stats normalizers have been configured."""
         return (
-            hasattr(self, "delta_obs_mean")
-            and self.delta_obs_mean is not None
-            and hasattr(self, "relative_action_mean")
-            and self.relative_action_mean is not None
+            self.delta_obs_normalizer.is_configured
+            and self.relative_action_normalizer.is_configured
         )
 
     def set_relative_stats(self, stats: dict) -> None:
-        """Register relative normalization statistics as persistent buffers.
+        """Configure normalizers with computed statistics.
 
         These stats are used to normalize observation deltas and relative actions
         in the forward pass, following the UMI approach of normalizing relative
@@ -144,59 +184,14 @@ class ACTUMIPolicy(PreTrainedPolicy):
                     "relative_action": {"mean": np.array, "std": np.array}
                 }
         """
-        # Register buffers - they'll be included in state_dict and saved/loaded automatically
-        self.register_buffer(
-            "delta_obs_mean",
-            torch.tensor(stats["delta_obs"]["mean"], dtype=torch.float32),
+        self.delta_obs_normalizer.configure(
+            mean=torch.as_tensor(stats["delta_obs"]["mean"]),
+            std=torch.as_tensor(stats["delta_obs"]["std"]),
         )
-        self.register_buffer(
-            "delta_obs_std",
-            torch.tensor(stats["delta_obs"]["std"], dtype=torch.float32),
+        self.relative_action_normalizer.configure(
+            mean=torch.as_tensor(stats["relative_action"]["mean"]),
+            std=torch.as_tensor(stats["relative_action"]["std"]),
         )
-        self.register_buffer(
-            "relative_action_mean",
-            torch.tensor(stats["relative_action"]["mean"], dtype=torch.float32),
-        )
-        self.register_buffer(
-            "relative_action_std",
-            torch.tensor(stats["relative_action"]["std"], dtype=torch.float32),
-        )
-
-    def load_state_dict(self, state_dict, strict=True):
-        """Override load_state_dict to register relative stats buffers if present.
-
-        When loading a model that has relative stats buffers, we need to register
-        them before loading so they're not treated as unexpected keys.
-        """
-        relative_stats_buffers = [
-            "delta_obs_mean",
-            "delta_obs_std",
-            "relative_action_mean",
-            "relative_action_std",
-        ]
-
-        # Check if any relative stats buffers are in the state dict but not registered
-        for buffer_name in relative_stats_buffers:
-            if buffer_name in state_dict and not hasattr(self, buffer_name):
-                # Buffer exists in state dict but not registered - register it
-                # Create a placeholder tensor with the same shape/dtype, load_state_dict will fill it
-                buffer_tensor = state_dict[buffer_name]
-                # Register with a zero tensor of same shape/dtype - load_state_dict will overwrite it
-                self.register_buffer(
-                    buffer_name,
-                    torch.zeros_like(buffer_tensor, dtype=buffer_tensor.dtype),
-                )
-
-        # Call parent load_state_dict (it will update the registered buffers)
-        return super().load_state_dict(state_dict, strict=strict)
-
-    def _normalize(self, tensor: Tensor, mean: Tensor, std: Tensor) -> Tensor:
-        """Normalize tensor using MEAN_STD normalization."""
-        return (tensor - mean) / (std + self._NORM_EPS)
-
-    def _unnormalize(self, tensor: Tensor, mean: Tensor, std: Tensor) -> Tensor:
-        """Unnormalize tensor using MEAN_STD normalization."""
-        return tensor * std + mean
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -236,9 +231,7 @@ class ACTUMIPolicy(PreTrainedPolicy):
 
         # Normalize delta observation if stats are available
         if self.has_relative_stats:
-            delta_obs_state = self._normalize(
-                delta_obs_state, self.delta_obs_mean, self.delta_obs_std
-            )
+            delta_obs_state = self.delta_obs_normalizer(delta_obs_state)
 
         # Create a modified batch with (normalized) delta observation
         inference_batch = dict(batch)
@@ -249,10 +242,8 @@ class ACTUMIPolicy(PreTrainedPolicy):
             relative_actions_normalized = self.predict_action_chunk(inference_batch)
             # Unnormalize if stats are available
             if self.has_relative_stats:
-                relative_actions = self._unnormalize(
-                    relative_actions_normalized,
-                    self.relative_action_mean,
-                    self.relative_action_std,
+                relative_actions = self.relative_action_normalizer.inverse(
+                    relative_actions_normalized
                 )
             else:
                 relative_actions = relative_actions_normalized
@@ -267,10 +258,8 @@ class ACTUMIPolicy(PreTrainedPolicy):
                 )[:, : self.config.n_action_steps]
                 # Unnormalize if stats are available
                 if self.has_relative_stats:
-                    relative_actions = self._unnormalize(
-                        relative_actions_normalized,
-                        self.relative_action_mean,
-                        self.relative_action_std,
+                    relative_actions = self.relative_action_normalizer.inverse(
+                        relative_actions_normalized
                     )
                 else:
                     relative_actions = relative_actions_normalized
@@ -326,14 +315,10 @@ class ACTUMIPolicy(PreTrainedPolicy):
         absolute_actions = batch[ACTION]
         relative_actions = absolute_actions - obs_state_t.unsqueeze(1)
 
-        # Normalize relative values using registered buffers (if stats were provided)
+        # Normalize relative values using normalizers (if stats were configured)
         if self.has_relative_stats:
-            delta_obs_state = self._normalize(
-                delta_obs_state, self.delta_obs_mean, self.delta_obs_std
-            )
-            relative_actions = self._normalize(
-                relative_actions, self.relative_action_mean, self.relative_action_std
-            )
+            delta_obs_state = self.delta_obs_normalizer(delta_obs_state)
+            relative_actions = self.relative_action_normalizer(relative_actions)
 
         # Create modified batch with (normalized) delta observation
         training_batch = dict(batch)

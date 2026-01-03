@@ -2,8 +2,14 @@
 """
 Manually push a trained ACT UMI model to HuggingFace Hub.
 
+This script pushes the complete model checkpoint including:
+- Model weights (model.safetensors)
+- Policy config (config.json)
+- Preprocessor pipeline with normalization stats (policy_preprocessor.json + .safetensors)
+- Postprocessor pipeline with unnormalization stats (policy_postprocessor.json + .safetensors)
+
 Usage:
-    python src/push_model_to_hub.py \
+    python src/zxtra/push_model_to_hub.py \
         --checkpoint_dir=outputs/train_act_umi_overfit/checkpoints/last/pretrained_model \
         --repo_id=giacomoran/my_model_name \
         --commit_message="Training completed"
@@ -14,114 +20,92 @@ import logging
 import sys
 from pathlib import Path
 
-import torch
-
-# Add project root to Python path for imports
-_project_root = Path(__file__).parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
-
-from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
-from lerobot.configs.types import FeatureType, PolicyFeature
-from safetensors.torch import load_file
-
-from act_umi import ACTUMIConfig, ACTUMIPolicy
+from huggingface_hub import HfApi
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def _convert_features_dict(config_dict: dict) -> dict:
-    """Convert feature dictionaries from JSON to PolicyFeature objects."""
-    for features_key in ["input_features", "output_features"]:
-        if features_key in config_dict:
-            features = {}
-            for key, ft_dict in config_dict[features_key].items():
-                feature_type_map = {
-                    "VISUAL": FeatureType.VISUAL,
-                    "STATE": FeatureType.STATE,
-                    "ACTION": FeatureType.ACTION,
-                    "ENV": FeatureType.ENV,
-                }
-                features[key] = PolicyFeature(
-                    type=feature_type_map[ft_dict["type"]],
-                    shape=tuple(ft_dict["shape"]),
-                )
-            config_dict[features_key] = features
-    return config_dict
 
 
 def push_model_to_hub(
     checkpoint_dir: Path,
     repo_id: str,
     commit_message: str = "Manual push",
-    device: str | None = None,
+    private: bool = False,
 ):
-    """Load a model from checkpoint and push it to HuggingFace Hub."""
+    """Push a complete model checkpoint to HuggingFace Hub.
 
+    This uploads all files from the checkpoint directory including:
+    - Model weights (model.safetensors)
+    - Policy config (config.json)
+    - Preprocessor pipeline (policy_preprocessor.json + normalization stats)
+    - Postprocessor pipeline (policy_postprocessor.json + unnormalization stats)
+
+    Args:
+        checkpoint_dir: Path to checkpoint directory (e.g., checkpoints/last/pretrained_model)
+        repo_id: HuggingFace Hub repository ID (e.g., 'username/model_name')
+        commit_message: Commit message for the push
+        private: Whether to create a private repository
+    """
     checkpoint_path = Path(checkpoint_dir)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_path}")
 
+    # Verify required files exist
     config_path = checkpoint_path / "config.json"
-    model_path = checkpoint_path / SAFETENSORS_SINGLE_FILE
+    model_path = checkpoint_path / "model.safetensors"
 
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found at {config_path}")
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found at {model_path}")
 
-    # Auto-select device
-    if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+    # Check for processor files (warn if missing)
+    preprocessor_path = checkpoint_path / "policy_preprocessor.json"
+    postprocessor_path = checkpoint_path / "policy_postprocessor.json"
 
-    logger.info(f"Loading model from {checkpoint_path}")
-    logger.info(f"Using device: {device}")
-
-    # Load config
-    import json
-
-    with open(config_path) as f:
-        config_dict = json.load(f)
-
-    # Remove type field if present (used by draccus for polymorphism)
-    config_dict.pop("type", None)
-
-    # Convert feature dictionaries to PolicyFeature objects
-    config_dict = _convert_features_dict(config_dict)
-
-    # Create config from dict
-    config = ACTUMIConfig(**config_dict)
-    config.device = device
-
-    # Create policy
-    policy = ACTUMIPolicy(config)
-
-    # Load weights
-    # Use strict=False to allow loading buffers (delta_obs_mean, etc.) that might be None initially
-    state_dict = load_file(str(model_path))
-    policy.load_state_dict(state_dict, strict=False)
-    policy = policy.to(device)
-    policy.eval()
-
-    logger.info(f"Loaded policy from {checkpoint_path}")
-    logger.info(f"Pushing to HuggingFace Hub: {repo_id}")
-
-    # Push to Hub
-    try:
-        policy.push_to_hub(
-            repo_id=repo_id,
-            commit_message=commit_message,
+    if not preprocessor_path.exists():
+        logger.warning(
+            f"Preprocessor config not found at {preprocessor_path}. "
+            "Model may be missing normalization stats!"
         )
-        logger.info(f"Successfully pushed model to {repo_id}")
-    except Exception as e:
-        logger.error(f"Failed to push model to Hub: {e}", exc_info=True)
-        sys.exit(1)
+    if not postprocessor_path.exists():
+        logger.warning(
+            f"Postprocessor config not found at {postprocessor_path}. "
+            "Model may be missing unnormalization stats!"
+        )
+
+    # List files to be uploaded
+    files_to_upload = list(checkpoint_path.glob("*.json")) + list(
+        checkpoint_path.glob("*.safetensors")
+    )
+    # Also include README if present
+    readme_path = checkpoint_path / "README.md"
+    if readme_path.exists():
+        files_to_upload.append(readme_path)
+
+    logger.info(f"Found {len(files_to_upload)} files to upload:")
+    for f in sorted(files_to_upload):
+        logger.info(f"  - {f.name}")
+
+    # Create/get repository and upload
+    api = HfApi()
+
+    logger.info(f"Creating/accessing repository: {repo_id}")
+    repo_url = api.create_repo(repo_id=repo_id, private=private, exist_ok=True)
+    logger.info(f"Repository URL: {repo_url}")
+
+    logger.info(f"Uploading files from {checkpoint_path}")
+    commit_info = api.upload_folder(
+        repo_id=repo_id,
+        repo_type="model",
+        folder_path=str(checkpoint_path),
+        commit_message=commit_message,
+        allow_patterns=["*.safetensors", "*.json", "*.md"],
+        ignore_patterns=["*.tmp", "*.log"],
+    )
+
+    logger.info(f"Successfully pushed model to {commit_info.repo_url}")
+    logger.info(f"Commit: {commit_info.commit_url}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,7 +117,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint_dir",
         type=str,
         required=True,
-        help="Path to checkpoint directory containing config.json and model.safetensors",
+        help="Path to checkpoint directory containing config.json, model.safetensors, and processor files",
     )
     parser.add_argument(
         "--repo_id",
@@ -148,10 +132,9 @@ def parse_args() -> argparse.Namespace:
         help="Commit message for the push",
     )
     parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Device to load model on (cuda/mps/cpu). Auto-detected if not specified.",
+        "--private",
+        action="store_true",
+        help="Create a private repository",
     )
 
     return parser.parse_args()
@@ -163,7 +146,7 @@ def main() -> None:
         checkpoint_dir=Path(args.checkpoint_dir),
         repo_id=args.repo_id,
         commit_message=args.commit_message,
-        device=args.device,
+        private=args.private,
     )
 
 
