@@ -148,9 +148,16 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
 
         self.reset()
 
-        # Compute relative stats from dataset if provided and not already configured
-        # This happens when training from scratch with lerobot-train
-        if dataset_meta is not None and not self.has_relative_stats:
+        # Compute relative stats from dataset if provided and not already configured.
+        # This happens when training from scratch with lerobot-train.
+        # When loading from pretrained (e.g., lerobot-record for evaluation), stats are
+        # loaded from the checkpoint AFTER __init__, so we skip computing here.
+        # We detect this by checking if pretrained_path is set in config.
+        if (
+            dataset_meta is not None
+            and not self.has_relative_stats
+            and self.config.pretrained_path is None
+        ):
             self._compute_and_set_relative_stats(dataset_meta)
 
     def _compute_and_set_relative_stats(self, dataset_meta) -> None:
@@ -168,7 +175,9 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         """
         from .relative_stats import compute_relative_stats
 
-        logging.info("Computing relative stats from dataset (one-time initialization)...")
+        logging.info(
+            "Computing relative stats from dataset (one-time initialization)..."
+        )
 
         # Recreate the dataset with appropriate delta_timestamps
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -906,4 +915,3 @@ def get_activation_fn(activation: str) -> Callable:
     if activation == "glu":
         return F.glu
     raise RuntimeError(f"activation should be relu/gelu/glu, not {activation}.")
-
