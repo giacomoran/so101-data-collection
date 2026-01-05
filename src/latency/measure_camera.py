@@ -38,7 +38,7 @@ _project_root = Path(__file__).parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.setup import (  # noqa: E402
+from src.shared.setup import (  # noqa: E402
     CAMERA_HEIGHT,
     CAMERA_WIDTH,
     WRIST_CAMERA_INDEX,

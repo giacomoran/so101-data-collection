@@ -20,8 +20,8 @@ if str(_project_root) not in sys.path:
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 
-from src.collect import DEFAULT_DATASET_ROOT  # noqa: E402
-from src.setup import HF_REPO_ID  # noqa: E402
+from src.collect.collect import DEFAULT_DATASET_ROOT  # noqa: E402
+from src.shared.setup import HF_REPO_ID  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

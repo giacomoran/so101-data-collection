@@ -34,7 +34,7 @@ _project_root = Path(__file__).parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from src.setup import ROBOT_ID, ROBOT_PORT  # noqa: E402
+from src.shared.setup import ROBOT_ID, ROBOT_PORT  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

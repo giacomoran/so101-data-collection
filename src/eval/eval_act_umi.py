@@ -227,6 +227,39 @@ def prepare_observation(
     return batch
 
 
+def prepare_observation_for_rerun(
+    obs: dict,
+    motor_names: list[str],
+    camera_names: list[str],
+) -> dict[str, np.ndarray]:
+    """Prepare observation for rerun visualization.
+
+    Converts raw robot observation to format expected by log_rerun_data.
+    Uses raw images (not normalized) for visualization.
+
+    Args:
+        obs: Raw observation from robot.get_observation()
+        motor_names: List of motor names in order
+        camera_names: List of camera names
+
+    Returns:
+        Dictionary with observation.state and observation.images.* as numpy arrays
+    """
+    observation_dict = {}
+
+    # Build observation.state from individual motor positions
+    state_values = [obs[motor] for motor in motor_names]
+    state_array = np.array(state_values, dtype=np.float32)
+    observation_dict["state"] = state_array
+
+    # Build observation.images.* from camera images (raw uint8 RGB, HWC format)
+    for cam_name in camera_names:
+        img = obs[cam_name]  # (H, W, C) uint8 RGB - already in HWC format
+        observation_dict[f"images.{cam_name}"] = img
+
+    return observation_dict
+
+
 def run_episode(
     robot,
     policy: ACTUMIPolicy,
@@ -287,6 +320,23 @@ def run_episode(
 
         # Send action to robot
         robot.send_action(action_dict)
+
+        # Log to rerun for visualization
+        if cfg.display_data:
+            try:
+                from lerobot.utils.visualization_utils import log_rerun_data
+
+                # Prepare observation for rerun (raw images, not normalized)
+                obs_for_rerun = prepare_observation_for_rerun(
+                    obs, motor_names, camera_names
+                )
+
+                # Log observation and action to rerun
+                log_rerun_data(observation=obs_for_rerun, action=action_dict)
+            except Exception as e:
+                # Don't fail if rerun logging fails
+                if step % 30 == 0:  # Only log error occasionally
+                    logging.debug(f"Rerun logging error: {e}")
 
         # Logging (every 30 steps = ~1 second at 30fps)
         if step % 30 == 0:
