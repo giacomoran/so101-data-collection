@@ -33,12 +33,7 @@ import qrcode
 from lerobot.cameras.opencv import OpenCVCamera
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
-# Add project root to Python path for imports
-_project_root = Path(__file__).parent.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
-
-from src.shared.setup import (  # noqa: E402
+from so101_data_collection.shared.setup import (
     CAMERA_HEIGHT,
     CAMERA_WIDTH,
     WRIST_CAMERA_INDEX,

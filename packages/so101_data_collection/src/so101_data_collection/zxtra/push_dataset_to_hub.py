@@ -13,15 +13,10 @@ import logging
 import sys
 from pathlib import Path
 
-# Add project root to Python path for imports
-_project_root = Path(__file__).parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
-
-from src.collect.collect import DEFAULT_DATASET_ROOT  # noqa: E402
-from src.shared.setup import HF_REPO_ID  # noqa: E402
+from so101_data_collection.collect.collect import DEFAULT_DATASET_ROOT
+from so101_data_collection.shared.setup import HF_REPO_ID
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

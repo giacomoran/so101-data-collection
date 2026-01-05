@@ -30,11 +30,7 @@ from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
 
 # Add project root to Python path for imports
-_project_root = Path(__file__).parent.parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
-
-from src.shared.setup import ROBOT_ID, ROBOT_PORT  # noqa: E402
+from so101_data_collection.shared.setup import ROBOT_ID, ROBOT_PORT
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

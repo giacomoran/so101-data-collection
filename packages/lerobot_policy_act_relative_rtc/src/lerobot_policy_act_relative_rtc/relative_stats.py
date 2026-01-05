@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-"""Utility functions for computing relative statistics for ACT UMI.
+"""Utility functions for computing relative statistics for ACT Relative RTC.
 
 This module computes normalization statistics on relative values (observation deltas
 and relative actions) rather than absolute values. This is necessary because:
@@ -71,14 +71,14 @@ def compute_relative_stats(
     )
 
     for batch in tqdm(dataloader, desc="Computing relative stats"):
-        # Extract obs[t-1] and obs[t] from stacked observations
+        # Extract obs[t-N] and obs[t] from stacked observations
         # obs.state shape: [batch, 2, state_dim]
         obs_state_stacked = batch[OBS_STATE]
-        obs_state_t_minus_1 = obs_state_stacked[:, 0, :]  # [batch, state_dim]
+        obs_state_t_minus_n = obs_state_stacked[:, 0, :]  # [batch, state_dim]
         obs_state_t = obs_state_stacked[:, 1, :]  # [batch, state_dim]
 
         # Compute delta observation (same as model.forward())
-        delta_obs = obs_state_t - obs_state_t_minus_1  # [batch, state_dim]
+        delta_obs = obs_state_t - obs_state_t_minus_n  # [batch, state_dim]
 
         # Compute relative actions (same as model.forward())
         # action shape: [batch, chunk_size, action_dim]
@@ -88,7 +88,7 @@ def compute_relative_stats(
         )  # [batch, chunk_size, action_dim]
 
         # Flatten relative_actions across batch and temporal dimensions
-        # This matches UMI's approach of treating all timesteps equally
+        # This treats all timesteps equally for statistics computation
         batch_size_actual, chunk_size, action_dim = relative_actions.shape
         relative_actions_flat = relative_actions.reshape(
             -1, action_dim
@@ -124,3 +124,4 @@ def compute_relative_stats(
         "delta_obs": delta_obs_stats,
         "relative_action": relative_action_stats,
     }
+

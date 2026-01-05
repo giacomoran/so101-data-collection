@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. All rights reserved.
-# Modified 2025 by Giacomo Randazzo for ACT with relative joint positions (UMI-style).
+# Modified 2025 by Giacomo Randazzo for ACT with relative joint positions.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 
 This configuration extends the standard ACT configuration to support relative
 joint positions. The key difference is that observation_delta_indices includes
-index -1 to fetch obs.state[t-1] for computing the observation delta.
+past frames to fetch obs.state[t-N] for computing the observation delta.
 """
 
 from dataclasses import dataclass, field
@@ -28,17 +28,17 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 
 
-@PreTrainedConfig.register_subclass("act_umi")
+@PreTrainedConfig.register_subclass("act_relative_rtc")
 @dataclass
-class ACTUMIConfig(PreTrainedConfig):
-    """Configuration class for ACT with Relative Joint Positions (UMI-style).
+class ACTRelativeRTCConfig(PreTrainedConfig):
+    """Configuration class for ACT with Relative Joint Positions.
 
     This is a modified version of ACTConfig that:
     - Uses relative joint positions as action representation (relative to obs.state[t])
-    - Uses observation deltas (obs.state[t] - obs.state[t-1]) as input
+    - Uses observation deltas (obs.state[t] - obs.state[t-N]) as input
 
-    The key change is that observation_delta_indices includes -1 to fetch the previous
-    observation state for computing deltas.
+    The key change is that observation_delta_indices includes past frames to fetch
+    observation states for computing deltas.
 
     Notes on the inputs and outputs:
         - At least one key starting with "observation.image" is required as input AND/OR
@@ -50,6 +50,8 @@ class ACTUMIConfig(PreTrainedConfig):
         n_obs_steps: Number of environment steps worth of observations to pass to the policy.
         chunk_size: The size of the action prediction "chunks" in units of environment steps.
         n_action_steps: The number of action steps to run in the environment for one invocation.
+        obs_state_delta_frames: Number of frames back for computing observation state delta.
+        use_rtc: Enable Real-Time Chunking (training-time smoothing). Reserved for future use.
         ... (other args same as ACTConfig)
     """
 
@@ -65,11 +67,15 @@ class ACTUMIConfig(PreTrainedConfig):
     # Higher values give larger, more meaningful deltas when data is high-frequency.
     obs_state_delta_frames: int = 1
 
-    # Normalization configuration for ACT UMI:
+    # Real-Time Chunking (RTC) - reserved for future implementation
+    # When enabled, will apply training-time smoothing to reduce discontinuities at chunk boundaries
+    use_rtc: bool = False
+
+    # Normalization configuration for ACT Relative:
     #
     # We disable normalization for STATE and ACTION features because the model computes
     # relative transformations from absolute values:
-    #   - Observation deltas: delta_obs = obs[t] - obs[t-1]
+    #   - Observation deltas: delta_obs = obs[t] - obs[t-N]
     #   - Relative actions: relative_action = action - obs[t]
     #
     # Normalization must happen AFTER computing these relative values, not before, because:
@@ -156,7 +162,7 @@ class ACTUMIConfig(PreTrainedConfig):
         # For relative positions, we need the robot state
         if not self.robot_state_feature:
             raise ValueError(
-                "ACTUMIConfig requires 'observation.state' as input for computing relative positions."
+                "ACTRelativeRTCConfig requires 'observation.state' as input for computing relative positions."
             )
 
     @property
@@ -176,16 +182,25 @@ class ACTUMIConfig(PreTrainedConfig):
     def image_delta_indices(self) -> list[int]:
         """Return indices for fetching images.
 
-        We only need the current frame for images (no delta computation).
-        This saves memory by not loading intermediate frames.
+        NOTE: Due to lerobot's resolve_delta_timestamps() applying observation_delta_indices
+        uniformly to ALL observation features, images will also be loaded with state_delta_indices.
+        This means 2 image frames are loaded when only 1 is needed. The model uses only the
+        last frame (index -1 or 1). This is wasteful but functional.
+
+        See README.md for details on this lerobot limitation.
         """
         return [0]
 
     @property
     def observation_delta_indices(self) -> list[int]:
-        """Backward compatibility - returns state_delta_indices.
+        """Return indices applied to ALL observation features by lerobot.
 
-        Note: Use state_delta_indices and image_delta_indices for new code.
+        This returns state_delta_indices because lerobot's resolve_delta_timestamps()
+        applies the same indices to all observation.* features. Since we need multiple
+        frames for state delta computation, images will also load multiple frames
+        (wasteful - we only use the last one).
+
+        Note: Use state_delta_indices and image_delta_indices for internal logic.
         """
         return self.state_delta_indices
 
@@ -196,3 +211,4 @@ class ACTUMIConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+

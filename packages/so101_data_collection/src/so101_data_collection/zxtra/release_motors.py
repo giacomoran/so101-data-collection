@@ -8,15 +8,11 @@ allowing the arms to be moved freely by hand.
 
 import argparse
 import sys
-from pathlib import Path
-
-# Add src to path for setup imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
 
-from setup import LEADER_PORT, ROBOT_PORT
+from so101_data_collection.shared.setup import LEADER_PORT, ROBOT_PORT
 
 # Motor configuration for SO-101 arms (same for leader and follower)
 SO101_MOTORS = {

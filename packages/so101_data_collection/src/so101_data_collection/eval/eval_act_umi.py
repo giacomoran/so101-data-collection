@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""Run ACTUMI policy on SO101 robot arm.
+"""Run ACT Relative RTC policy on SO101 robot arm.
 
-This script evaluates an ACTUMI policy on the real SO101 robot. Unlike the standard
+This script evaluates an ACT Relative RTC policy on the real SO101 robot. Unlike the standard
 lerobot-record script, this is simplified for single-episode evaluation without
 dataset recording.
 
 Usage:
-    python src/run_act_umi.py \
+    python -m so101_data_collection.eval.eval_act_umi \
         --policy_repo_id=giacomoran/so101_data_collection_cube_hand_guided_act_umi_wrist_3 \
         --robot_port=/dev/tty.usbmodem5A460829821 \
         --camera_index=1 \
@@ -14,27 +14,22 @@ Usage:
         --fps=30
 
     # With device override:
-    python src/run_act_umi.py \
+    python -m so101_data_collection.eval.eval_act_umi \
         --policy_repo_id=giacomoran/so101_data_collection_cube_hand_guided_act_umi_wrist_3 \
         --robot_port=/dev/tty.usbmodem5A460829821 \
         --device=mps
 """
 
 import logging
-import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from pprint import pformat
 
 import draccus
 import numpy as np
 import torch
 
-# Add src to path for act_umi imports
-sys.path.insert(0, str(Path(__file__).parent))
-
-from act_umi import ACTUMIPolicy
+from lerobot_policy_act_relative_rtc import ACTRelativeRTCPolicy
 
 # ImageNet normalization constants (used by pretrained ResNet backbones)
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
@@ -42,8 +37,8 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
 
 
 @dataclass
-class RunACTUMIConfig:
-    """Configuration for running ACTUMI on SO101."""
+class RunACTRelativeRTCConfig:
+    """Configuration for running ACT Relative RTC on SO101."""
 
     # Policy configuration
     policy_repo_id: str = (
@@ -94,8 +89,8 @@ def get_device(device: str | None) -> torch.device:
     return torch.device("cpu")
 
 
-def load_actumi_policy(repo_id: str, device: torch.device) -> ACTUMIPolicy:
-    """Load ACTUMI policy from HuggingFace Hub.
+def load_policy(repo_id: str, device: torch.device) -> ACTRelativeRTCPolicy:
+    """Load ACT Relative RTC policy from HuggingFace Hub.
 
     Note: The policy's relative stats are stored in Normalizer submodules
     (delta_obs_normalizer, relative_action_normalizer) and loaded automatically.
@@ -104,9 +99,9 @@ def load_actumi_policy(repo_id: str, device: torch.device) -> ACTUMIPolicy:
     Returns:
         The loaded policy ready for inference.
     """
-    logging.info(f"Loading ACTUMI policy from {repo_id}")
+    logging.info(f"Loading ACT Relative RTC policy from {repo_id}")
 
-    policy = ACTUMIPolicy.from_pretrained(repo_id)
+    policy = ACTRelativeRTCPolicy.from_pretrained(repo_id)
     policy.config.device = str(device)
     policy = policy.to(device)
     policy.eval()
@@ -156,7 +151,7 @@ def init_keyboard_listener():
         return None, events
 
 
-def make_robot(cfg: RunACTUMIConfig):
+def make_robot(cfg: RunACTRelativeRTCConfig):
     """Create and configure the SO101 robot."""
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
     from lerobot.robots import make_robot_from_config, so100_follower
@@ -262,9 +257,9 @@ def prepare_observation_for_rerun(
 
 def run_episode(
     robot,
-    policy: ACTUMIPolicy,
+    policy: ACTRelativeRTCPolicy,
     events: dict,
-    cfg: RunACTUMIConfig,
+    cfg: RunACTRelativeRTCConfig,
     device: torch.device,
 ):
     """Run a single episode with the policy."""
@@ -372,7 +367,7 @@ def log_say(message: str, play_sounds: bool, blocking: bool = False):
 
 
 @draccus.wrap()
-def main(cfg: RunACTUMIConfig):
+def main(cfg: RunACTRelativeRTCConfig):
     """Main entry point."""
     init_logging()
     logging.info(pformat(cfg))
@@ -382,7 +377,7 @@ def main(cfg: RunACTUMIConfig):
     logging.info(f"Using device: {device}")
 
     # Load policy
-    policy = load_actumi_policy(cfg.policy_repo_id, device)
+    policy = load_policy(cfg.policy_repo_id, device)
 
     # Create robot
     logging.info("Initializing robot...")

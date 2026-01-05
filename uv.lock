@@ -10,6 +10,12 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform != 'linux'",
 ]
 
+[manifest]
+members = [
+    "lerobot-policy-act-relative-rtc",
+    "so101-data-collection",
+]
+
 [[package]]
 name = "accelerate"
 version = "1.12.0"
@@ -1243,6 +1249,17 @@ dependencies = [
 feetech = [
     { name = "feetech-servo-sdk" },
 ]
+
+[[package]]
+name = "lerobot-policy-act-relative-rtc"
+version = "0.1.0"
+source = { editable = "packages/lerobot_policy_act_relative_rtc" }
+dependencies = [
+    { name = "lerobot" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "lerobot", git = "https://github.com/huggingface/lerobot.git?rev=6d0d65a5fec490c966b186bf9455ed3ea82f3f52" }]
 
 [[package]]
 name = "markupsafe"
@@ -2980,9 +2997,10 @@ wheels = [
 [[package]]
 name = "so101-data-collection"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "packages/so101_data_collection" }
 dependencies = [
     { name = "lerobot", extra = ["feetech"] },
+    { name = "lerobot-policy-act-relative-rtc" },
     { name = "matplotlib" },
     { name = "qrcode", extra = ["pil"] },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2992,6 +3010,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "lerobot", extras = ["feetech"], git = "https://github.com/huggingface/lerobot.git?rev=6d0d65a5fec490c966b186bf9455ed3ea82f3f52" },
+    { name = "lerobot-policy-act-relative-rtc", editable = "packages/lerobot_policy_act_relative_rtc" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "qrcode", extras = ["pil"], specifier = ">=8.0" },
     { name = "scipy", specifier = ">=1.15.3" },

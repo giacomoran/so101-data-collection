@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. All rights reserved.
-# Modified 2025 by Giacomo Randazzo for ACT with relative joint positions (UMI-style).
+# Modified 2025 by Giacomo Randazzo for ACT with relative joint positions.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,23 +42,26 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
-from .configuration_act_umi import ACTUMIConfig
+from .configuration_act_relative_rtc import ACTRelativeRTCConfig
 
 
-def make_act_umi_pre_post_processors(
-    config: ACTUMIConfig,
+def make_act_relative_rtc_pre_post_processors(
+    config: ACTRelativeRTCConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
-    """Creates the pre- and post-processing pipelines for the ACT UMI policy.
+    """Creates the pre- and post-processing pipelines for the ACT Relative RTC policy.
 
     The processing is the same as standard ACT - the relative position transformations
     are handled in the model's forward pass, not here.
 
+    Note: This function name follows lerobot's naming convention for dynamic import:
+    make_{policy_type}_pre_post_processors
+
     Args:
-        config (ACTUMIConfig): The ACT UMI policy configuration object.
+        config (ACTRelativeRTCConfig): The policy configuration object.
         dataset_stats (dict[str, dict[str, torch.Tensor]] | None): Dataset statistics for normalization.
 
     Returns:
@@ -97,3 +100,4 @@ def make_act_umi_pre_post_processors(
             to_output=transition_to_policy_action,
         ),
     )
+

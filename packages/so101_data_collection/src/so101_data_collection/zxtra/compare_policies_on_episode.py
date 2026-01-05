@@ -4,7 +4,7 @@
 This script helps verify policy behavior before deployment on hardware by comparing
 predicted action chunks against ground truth from the training data.
 
-Supports different policy types (ACT, ACTUMI, etc.) and action representations
+Supports different policy types (ACT, ACT Relative RTC, etc.) and action representations
 (absolute vs relative joint positions).
 
 Usage:
@@ -22,7 +22,6 @@ Usage:
 
 import json
 import logging
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,14 +31,9 @@ import draccus
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
-from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.utils import init_logging
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 
 # ============================================================================
 # Protocol for policies with different action representations
@@ -59,32 +53,12 @@ def is_relative_action_policy(policy: PreTrainedPolicy) -> bool:
     """Check if a policy uses relative action representation."""
     # Check by policy type name or config class
     policy_type = getattr(policy.config, "type", None) or policy.name
-    return policy_type in ("act_umi",)
+    return policy_type in ("act_relative_rtc",)
 
 
 # ============================================================================
 # Policy loading utilities
 # ============================================================================
-
-
-def _convert_features_dict(config_dict: dict) -> dict:
-    """Convert feature dictionaries from JSON to PolicyFeature objects."""
-    for features_key in ["input_features", "output_features"]:
-        if features_key in config_dict:
-            features = {}
-            for key, ft_dict in config_dict[features_key].items():
-                feature_type_map = {
-                    "VISUAL": FeatureType.VISUAL,
-                    "STATE": FeatureType.STATE,
-                    "ACTION": FeatureType.ACTION,
-                    "ENV": FeatureType.ENV,
-                }
-                features[key] = PolicyFeature(
-                    type=feature_type_map[ft_dict["type"]],
-                    shape=tuple(ft_dict["shape"]),
-                )
-            config_dict[features_key] = features
-    return config_dict
 
 
 def load_policy_from_path(
@@ -94,8 +68,8 @@ def load_policy_from_path(
     """Load any policy from a local path or HuggingFace repo ID.
 
     Uses PreTrainedPolicy.from_pretrained() which handles both local paths
-    and HuggingFace repos. For custom policies (act_umi), falls back to
-    manual loading.
+    and HuggingFace repos. For custom policies (act_relative_rtc), uses
+    direct import and from_pretrained().
 
     Returns:
         Tuple of (policy, policy_type_name)
@@ -107,6 +81,7 @@ def load_policy_from_path(
         path.parent.exists() and (path / "config.json").exists()
     )
 
+    # Determine policy type from config
     if is_local_path:
         # Local path - check if it's a directory with config.json
         if path.is_dir():
@@ -128,45 +103,7 @@ def load_policy_from_path(
         if policy_type is None:
             raise ValueError(f"Config at {config_path} missing 'type' field")
 
-        # For act_umi, use manual loading
-        if policy_type == "act_umi":
-            from safetensors.torch import load_file
-
-            from act_umi import ACTUMIConfig, ACTUMIPolicy
-
-            config_dict.pop("type", None)
-            config_dict = _convert_features_dict(config_dict)
-            # Don't set device in config_dict to avoid warning in __post_init__
-            config_dict.pop("device", None)
-            config = ACTUMIConfig(**config_dict)
-            # Now set device after __post_init__ has run
-            config.device = device
-
-            policy = ACTUMIPolicy(config)
-            model_path = path / SAFETENSORS_SINGLE_FILE
-            if not model_path.exists():
-                raise FileNotFoundError(f"Model not found at {model_path}")
-
-            # Load state dict manually to handle buffers properly
-            # Use strict=False to allow loading buffers that might be None initially
-            state_dict = load_file(str(model_path))
-            policy.load_state_dict(state_dict, strict=False)
-            policy = policy.to(device)
-            policy.eval()
-            logging.info(f"Loaded {policy_type} policy from {path}")
-            return policy, policy_type
-        else:
-            # Use lerobot's from_pretrained for standard policies
-            from lerobot.policies.factory import get_policy_class
-
-            policy_cls = get_policy_class(policy_type)
-            # from_pretrained handles device selection properly
-            policy = policy_cls.from_pretrained(
-                str(path),
-                device=device,
-            )
-            logging.info(f"Loaded {policy_type} policy from {path}")
-            return policy, policy_type
+        pretrained_path = str(path)
     else:
         # HuggingFace repo ID - download config to determine policy type
         from huggingface_hub import hf_hub_download
@@ -186,31 +123,31 @@ def load_policy_from_path(
                 f"Config from {pretrained_name_or_path} missing 'type' field"
             )
 
-        if policy_type == "act_umi":
-            # For act_umi, use from_pretrained but override device after
-            from act_umi import ACTUMIPolicy
+        pretrained_path = pretrained_name_or_path
 
-            # Load policy with from_pretrained (it will handle config loading internally)
-            # But we need to override device to avoid the warning
-            policy = ACTUMIPolicy.from_pretrained(
-                pretrained_name_or_path,
-            )
-            # Override device after loading to avoid duplicate warning
-            policy.config.device = device
-            policy = policy.to(device)
-        else:
-            from lerobot.policies.factory import get_policy_class
+    # Load policy using from_pretrained()
+    if policy_type == "act_relative_rtc":
+        # For act_relative_rtc, use direct import (not registered in factory)
+        from lerobot_policy_act_relative_rtc import ACTRelativeRTCPolicy
 
-            policy_cls = get_policy_class(policy_type)
-            policy = policy_cls.from_pretrained(
-                pretrained_name_or_path,
-                device=device,
-            )
-
-        logging.info(
-            f"Loaded {policy_type} policy from HuggingFace: {pretrained_name_or_path}"
+        policy = ACTRelativeRTCPolicy.from_pretrained(
+            pretrained_path,
+            device=device,
         )
-        return policy, policy_type
+    else:
+        # Use lerobot's factory for standard policies
+        from lerobot.policies.factory import get_policy_class
+
+        policy_cls = get_policy_class(policy_type)
+        policy = policy_cls.from_pretrained(
+            pretrained_path,
+            device=device,
+        )
+
+    policy.eval()
+    source = "local path" if is_local_path else "HuggingFace"
+    logging.info(f"Loaded {policy_type} policy from {source}: {pretrained_path}")
+    return policy, policy_type
 
 
 # ============================================================================
@@ -227,7 +164,7 @@ def get_delta_timestamps_for_policy(
     action_timestamps = [i / fps for i in range(chunk_size)]
 
     if is_relative_action_policy(policy):
-        # ACTUMI needs obs[t-1] and obs[t] for delta computation
+        # ACT Relative RTC needs obs[t-1] and obs[t] for delta computation
         return {
             "observation.state": [-1 / fps, 0],
             "observation.images.wrist": [-1 / fps, 0],
@@ -251,14 +188,14 @@ def predict_action_chunk_absolute(
 ) -> tuple[np.ndarray, float]:
     """Predict an action chunk and convert to absolute positions.
 
-    Handles both absolute (ACT) and relative (ACTUMI) action representations.
+    Handles both absolute (ACT) and relative (ACT Relative RTC) action representations.
 
     Returns:
         pred_actions_absolute: [chunk_size, action_dim] absolute joint positions
         inference_time: time taken for inference in seconds
     """
     if is_relative_action_policy(policy):
-        # ACTUMI: input is delta observation, output is relative actions
+        # ACT Relative RTC: input is delta observation, output is relative actions
         obs_state_stacked = sample["observation.state"]  # [2, state_dim]
         obs_t_minus_1 = obs_state_stacked[0]  # [state_dim]
         obs_t = obs_state_stacked[1]  # [state_dim]

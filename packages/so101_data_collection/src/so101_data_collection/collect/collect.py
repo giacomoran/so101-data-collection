@@ -68,8 +68,11 @@ from lerobot.utils.control_utils import (  # noqa: E402
 from lerobot.utils.robot_utils import precise_sleep  # noqa: E402
 from lerobot.utils.utils import init_logging, log_say  # noqa: E402
 
-from src.shared.benchmark_tracker import BenchmarkTracker, SessionMetrics  # noqa: E402
-from src.shared.setup import (  # noqa: E402
+from so101_data_collection.shared.benchmark_tracker import (  # noqa: E402
+    BenchmarkTracker,
+    SessionMetrics,
+)
+from so101_data_collection.shared.setup import (  # noqa: E402
     CAMERA_HEIGHT,
     CAMERA_WIDTH,
     HF_REPO_ID,

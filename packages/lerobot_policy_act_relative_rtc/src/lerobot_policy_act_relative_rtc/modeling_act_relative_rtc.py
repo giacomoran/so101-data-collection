@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. All rights reserved.
-# Modified 2025 by Giacomo Randazzo for ACT with relative joint positions (UMI-style).
+# Modified 2025 by Giacomo Randazzo for ACT with relative joint positions.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,15 +18,16 @@
 
 This is a modified version of ACT that:
 - Uses relative joint positions as action representation (action - obs.state[t])
-- Uses observation deltas (obs.state[t] - obs.state[t-1]) as input
+- Uses observation deltas (obs.state[t] - obs.state[t-N]) as input
 
 Key changes from standard ACT:
 - forward(): Converts absolute actions to relative before computing loss
-- forward(): Computes observation delta from obs.state[t-1] and obs.state[t]
+- forward(): Computes observation delta from obs.state[t-N] and obs.state[t]
 - select_action(): Converts predicted relative actions back to absolute
 - Uses queue-based observation history tracking (following lerobot conventions)
 """
 
+import logging
 import math
 from collections import deque
 from collections.abc import Callable
@@ -44,7 +45,7 @@ from torch import Tensor, nn
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
-from .configuration_act_umi import ACTUMIConfig
+from .configuration_act_relative_rtc import ACTRelativeRTCConfig
 
 
 class Normalizer(nn.Module):
@@ -87,38 +88,49 @@ class Normalizer(nn.Module):
         return x * self.std + self.mean
 
 
-class ACTUMIPolicy(PreTrainedPolicy):
+class ACTRelativeRTCPolicy(PreTrainedPolicy):
     """ACT Policy with Relative Joint Positions.
 
     This policy predicts actions relative to the current observation state,
     and uses observation deltas as input instead of absolute positions.
 
     Training:
-        - Receives obs.state with shape [batch, 2, state_dim] containing [obs[t-1], obs[t]]
-        - Computes delta_obs = obs[t] - obs[t-1]
+        - Receives obs.state with shape [batch, 2, state_dim] containing [obs[t-N], obs[t]]
+        - Computes delta_obs = obs[t] - obs[t-N]
         - Converts absolute actions to relative: rel_action = action - obs[t]
         - Predicts relative actions and computes loss
 
     Inference:
         - Maintains observation history using a queue (following lerobot conventions)
-        - Computes delta_obs = obs[t] - obs[t-1] from stacked observations
+        - Computes delta_obs = obs[t] - obs[t-N] from stacked observations
         - Predicts relative actions
         - Converts back to absolute: action = rel_action + obs[t]
     """
 
-    config_class = ACTUMIConfig
-    name = "act_umi"
+    config_class = ACTRelativeRTCConfig
+    name = "act_relative_rtc"
 
     def __init__(
         self,
-        config: ACTUMIConfig,
+        config: ACTRelativeRTCConfig,
+        dataset_meta=None,
         **kwargs,
     ):
+        """Initialize the ACT Relative RTC policy.
+
+        Args:
+            config: Policy configuration.
+            dataset_meta: Optional LeRobotDatasetMetadata. If provided and relative stats
+                are not already configured (e.g., from a checkpoint), the dataset will be
+                recreated and relative stats will be computed. This happens automatically
+                when using lerobot-train.
+            **kwargs: Additional arguments (ignored).
+        """
         super().__init__(config)
         config.validate_features()
         self.config = config
 
-        self.model = ACTUMI(config)
+        self.model = ACTRelativeRTC(config)
 
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(
@@ -135,6 +147,66 @@ class ACTUMIPolicy(PreTrainedPolicy):
         self.relative_action_normalizer = Normalizer(action_dim)
 
         self.reset()
+
+        # Compute relative stats from dataset if provided and not already configured
+        # This happens when training from scratch with lerobot-train
+        if dataset_meta is not None and not self.has_relative_stats:
+            self._compute_and_set_relative_stats(dataset_meta)
+
+    def _compute_and_set_relative_stats(self, dataset_meta) -> None:
+        """Compute relative stats from dataset metadata and configure normalizers.
+
+        This method recreates the dataset using dataset_meta.repo_id and dataset_meta.root,
+        then iterates through it to compute statistics on relative values (delta_obs and
+        relative_action). This is a one-time cost during initial training.
+
+        Note: This recreates the dataset, which is redundant with lerobot's dataset creation,
+        but unavoidable given lerobot's API (make_policy only receives metadata, not the dataset).
+
+        Args:
+            dataset_meta: LeRobotDatasetMetadata with repo_id and root for dataset recreation.
+        """
+        from .relative_stats import compute_relative_stats
+
+        logging.info("Computing relative stats from dataset (one-time initialization)...")
+
+        # Recreate the dataset with appropriate delta_timestamps
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+        # Build delta_timestamps for relative stats computation
+        delta_timestamps = {}
+        for key in dataset_meta.features:
+            if key == ACTION:
+                delta_timestamps[key] = [
+                    i / dataset_meta.fps for i in self.config.action_delta_indices
+                ]
+            elif key == OBS_STATE:
+                delta_timestamps[key] = [
+                    i / dataset_meta.fps for i in self.config.state_delta_indices
+                ]
+            elif key.startswith("observation."):
+                # For images and other observations, use state_delta_indices
+                # (lerobot applies same indices to all observations)
+                delta_timestamps[key] = [
+                    i / dataset_meta.fps for i in self.config.state_delta_indices
+                ]
+
+        dataset = LeRobotDataset(
+            dataset_meta.repo_id,
+            root=dataset_meta.root,
+            delta_timestamps=delta_timestamps,
+        )
+
+        # Compute relative stats
+        stats = compute_relative_stats(
+            dataset,
+            batch_size=64,
+            num_workers=4,
+        )
+
+        # Configure normalizers
+        self.set_relative_stats(stats)
+        logging.info("Relative stats computed and configured successfully.")
 
     def get_optim_params(self) -> list[dict]:
         """Return parameter groups for optimizer with differential learning rates.
@@ -174,8 +246,7 @@ class ACTUMIPolicy(PreTrainedPolicy):
         """Configure normalizers with computed statistics.
 
         These stats are used to normalize observation deltas and relative actions
-        in the forward pass, following the UMI approach of normalizing relative
-        values rather than absolute values.
+        in the forward pass, normalizing relative values rather than absolute values.
 
         Args:
             stats: Dictionary with structure:
@@ -293,22 +364,22 @@ class ACTUMIPolicy(PreTrainedPolicy):
         """Run the batch through the model and compute the loss for training.
 
         During training:
-        - batch[OBS_STATE] has shape [batch, 2, state_dim] containing [obs[t-1], obs[t]]
+        - batch[OBS_STATE] has shape [batch, 2, state_dim] containing [obs[t-N], obs[t]]
         - batch[ACTION] has shape [batch, chunk_size, action_dim] (absolute actions)
 
         We compute:
-        - delta_obs = obs[t] - obs[t-1]
+        - delta_obs = obs[t] - obs[t-N]
         - relative_actions = action - obs[t]
         - Normalize both using registered relative stats (if available)
         """
-        # Extract obs[t-1] and obs[t] from stacked observations
+        # Extract obs[t-N] and obs[t] from stacked observations
         # obs.state shape: [batch, 2, state_dim]
         obs_state_stacked = batch[OBS_STATE]
-        obs_state_t_minus_1 = obs_state_stacked[:, 0, :]  # [batch, state_dim]
+        obs_state_t_minus_n = obs_state_stacked[:, 0, :]  # [batch, state_dim]
         obs_state_t = obs_state_stacked[:, 1, :]  # [batch, state_dim]
 
         # Compute delta observation
-        delta_obs_state = obs_state_t - obs_state_t_minus_1  # [batch, state_dim]
+        delta_obs_state = obs_state_t - obs_state_t_minus_n  # [batch, state_dim]
 
         # Convert absolute actions to relative actions
         # action shape: [batch, chunk_size, action_dim]
@@ -326,10 +397,12 @@ class ACTUMIPolicy(PreTrainedPolicy):
         training_batch[OBS_STATE] = delta_obs_state
 
         if self.config.image_features:
-            # Images now have shape [batch, channels, height, width] (not stacked)
-            # since we only request current frame via image_delta_indices=[0]
+            # Images have shape [batch, 2, channels, height, width] due to lerobot loading
+            # 2 frames (observation_delta_indices applies to all observations).
+            # We only use the last frame (index 1 = current frame).
             training_batch[OBS_IMAGES] = [
-                batch[key] for key in self.config.image_features
+                batch[key][:, -1] if batch[key].dim() == 5 else batch[key]
+                for key in self.config.image_features
             ]
 
         # Forward through model to get predicted (normalized) relative actions
@@ -416,15 +489,15 @@ class ACTTemporalEnsembler:
         return action
 
 
-class ACTUMI(nn.Module):
-    """ACT model modified for relative joint positions (UMI-style).
+class ACTRelativeRTC(nn.Module):
+    """ACT model modified for relative joint positions.
 
     The core architecture is identical to ACT, but it operates on:
     - Delta observation states instead of absolute states
     - Predicts relative actions instead of absolute actions
     """
 
-    def __init__(self, config: ACTUMIConfig):
+    def __init__(self, config: ACTRelativeRTCConfig):
         super().__init__()
         self.config = config
 
@@ -510,7 +583,7 @@ class ACTUMI(nn.Module):
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """Forward pass through ACT with relative positions.
 
-        Note: batch[OBS_STATE] should already be the delta observation (obs[t] - obs[t-1])
+        Note: batch[OBS_STATE] should already be the delta observation (obs[t] - obs[t-N])
         when called during training, or the delta computed from stored previous obs during inference.
         """
         if self.config.use_vae and self.training:
@@ -621,7 +694,7 @@ class ACTUMI(nn.Module):
 class ACTEncoder(nn.Module):
     """Convenience module for running multiple encoder layers, maybe followed by normalization."""
 
-    def __init__(self, config: ACTUMIConfig, is_vae_encoder: bool = False):
+    def __init__(self, config: ACTRelativeRTCConfig, is_vae_encoder: bool = False):
         super().__init__()
         self.is_vae_encoder = is_vae_encoder
         num_layers = (
@@ -647,7 +720,7 @@ class ACTEncoder(nn.Module):
 
 
 class ACTEncoderLayer(nn.Module):
-    def __init__(self, config: ACTUMIConfig):
+    def __init__(self, config: ACTRelativeRTCConfig):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(
             config.dim_model, config.n_heads, dropout=config.dropout
@@ -686,7 +759,7 @@ class ACTEncoderLayer(nn.Module):
 
 
 class ACTDecoder(nn.Module):
-    def __init__(self, config: ACTUMIConfig):
+    def __init__(self, config: ACTRelativeRTCConfig):
         super().__init__()
         self.layers = nn.ModuleList(
             [ACTDecoderLayer(config) for _ in range(config.n_decoder_layers)]
@@ -713,7 +786,7 @@ class ACTDecoder(nn.Module):
 
 
 class ACTDecoderLayer(nn.Module):
-    def __init__(self, config: ACTUMIConfig):
+    def __init__(self, config: ACTRelativeRTCConfig):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(
             config.dim_model, config.n_heads, dropout=config.dropout
@@ -833,3 +906,4 @@ def get_activation_fn(activation: str) -> Callable:
     if activation == "glu":
         return F.glu
     raise RuntimeError(f"activation should be relu/gelu/glu, not {activation}.")
+
