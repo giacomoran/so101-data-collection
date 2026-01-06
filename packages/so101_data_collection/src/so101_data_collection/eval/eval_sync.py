@@ -56,72 +56,7 @@ from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 from lerobot_policy_act_relative_rtc import ACTRelativeRTCConfig  # noqa: F401
 
-# ============================================================================
-# Latency Tracking
-# ============================================================================
-
-
-class LatencyTracker:
-    """Tracks inference latency and logs metrics to rerun."""
-
-    def __init__(self):
-        self.latencies_ms: list[float] = []
-        self.chunk_idx: int = 0
-
-    def record(self, latency_ms: float, log_to_rerun: bool = True) -> None:
-        """Record a single inference latency measurement."""
-        self.latencies_ms.append(latency_ms)
-        if log_to_rerun:
-            rr.set_time("inference_idx", sequence=self.chunk_idx)
-            rr.log("metrics/inference_latency", rr.Scalars(latency_ms))
-        self.chunk_idx += 1
-
-    def get_stats(self) -> dict:
-        """Compute summary statistics."""
-        if not self.latencies_ms:
-            return {}
-        arr = np.array(self.latencies_ms)
-        return {
-            "count": len(arr),
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr)),
-            "min": float(np.min(arr)),
-            "max": float(np.max(arr)),
-            "p50": float(np.percentile(arr, 50)),
-            "p95": float(np.percentile(arr, 95)),
-        }
-
-    def log_summary_to_rerun(self) -> None:
-        """Log summary statistics and histogram to rerun."""
-        if not self.latencies_ms:
-            return
-
-        stats = self.get_stats()
-
-        # Log summary as markdown text
-        summary_text = f"""**Inference Latency Stats**
-- Count: {stats["count"]}
-- Mean: {stats["mean"]:.1f}ms
-- Std: {stats["std"]:.1f}ms
-- Min: {stats["min"]:.1f}ms
-- Max: {stats["max"]:.1f}ms
-- P50: {stats["p50"]:.1f}ms
-- P95: {stats["p95"]:.1f}ms
-"""
-        rr.log(
-            "metrics/latency_summary",
-            rr.TextDocument(summary_text, media_type=rr.MediaType.MARKDOWN),
-        )
-
-        # Log histogram
-        hist, _ = np.histogram(self.latencies_ms, bins=20)
-        rr.log("metrics/latency_histogram", rr.BarChart(hist))
-
-    def reset(self) -> None:
-        """Reset tracker for a new episode."""
-        self.latencies_ms = []
-        self.chunk_idx = 0
-
+from so101_data_collection.eval.trackers import LatencyTracker
 
 # ============================================================================
 # Configuration
