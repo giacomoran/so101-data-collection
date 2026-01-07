@@ -6,7 +6,9 @@ Tests multiple capture strategies:
 1. Default OpenCV capture (baseline - matches lerobot behavior)
 2. OpenCV with CAP_PROP_BUFFERSIZE=1 (attempt to disable buffering)
 3. OpenCV with frame flushing (grab and discard old frames)
-4. OpenCV with MJPG codec (often lower latency than YUYV) it
+4. OpenCV with MJPG codec (often lower latency than YUYV)
+
+The rolling QR code display is automatically started as a separate process.
 
 Usage:
     python -m src.latency.measure_camera_raw --camera 1 --duration 10
@@ -16,17 +18,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 
 import cv2
 import numpy as np
-import qrcode
 
-# Add project root to Python path for imports
 from so101_data_collection.shared.setup import (
     CAMERA_HEIGHT,
     CAMERA_WIDTH,
@@ -35,9 +35,6 @@ from so101_data_collection.shared.setup import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-QR_WINDOW_NAME = "Latency Test - QR Code"
-QR_SIZE = 800
 
 
 class CaptureMethod(str, Enum):
@@ -79,44 +76,6 @@ class Stats:
             "median_ms": float(np.median(arr)),
             "p95_ms": float(np.percentile(arr, 95)),
         }
-
-
-def generate_qr_image(data: str, size: int = QR_SIZE) -> np.ndarray:
-    """Generate QR code image."""
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    img_array = np.array(img.convert("RGB"))
-    img_resized = cv2.resize(img_array, (size, size), interpolation=cv2.INTER_NEAREST)
-    return cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR)
-
-
-def create_display_frame(timestamp: float) -> np.ndarray:
-    """Create display frame with QR code and timestamp text."""
-    timestamp_str = f"{timestamp:.6f}"
-    qr_img = generate_qr_image(timestamp_str)
-
-    # Add padding for text
-    frame = np.ones((QR_SIZE + 60, QR_SIZE, 3), dtype=np.uint8) * 255
-    frame[:QR_SIZE, :QR_SIZE] = qr_img
-
-    # Add timestamp text
-    cv2.putText(
-        frame,
-        f"t={timestamp_str}",
-        (10, QR_SIZE + 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (0, 0, 0),
-        1,
-    )
-    return frame
 
 
 def setup_camera(
@@ -212,6 +171,44 @@ def decode_qr(image: np.ndarray, detector: cv2.QRCodeDetector) -> str | None:
     return data if data else None
 
 
+def start_rolling_qr_process(fps: float = 30.0) -> subprocess.Popen:
+    """
+    Start the rolling QR code display as a separate process.
+
+    The QR display will run indefinitely until terminated.
+
+    Args:
+        fps: Frame rate for QR display
+
+    Returns:
+        Popen process object for the QR display
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "so101_data_collection.shared.rolling_qr",
+        "--fps",
+        str(fps),
+        # No --duration flag - runs indefinitely until terminated
+    ]
+    logger.info(f"Starting rolling QR display process: {' '.join(cmd)}")
+    # Don't redirect stdout/stderr - GUI windows need direct access to the display
+    # on macOS. Redirecting them prevents the window from appearing.
+    # Let stdout/stderr go to the terminal so the GUI can work properly.
+    process = subprocess.Popen(cmd)
+    # Give it a moment to initialize and create the window
+    time.sleep(1.0)
+    if process.poll() is not None:
+        # Process exited early - try to get error info
+        returncode = process.returncode
+        raise RuntimeError(
+            f"QR display process exited early with return code {returncode}. "
+            f"Check that OpenCV can create windows and that no other QR display is running."
+        )
+    logger.info("Rolling QR display started successfully")
+    return process
+
+
 def run_measurement(
     camera_index: int,
     width: int,
@@ -220,6 +217,7 @@ def run_measurement(
     duration_s: float,
     method: CaptureMethod,
     display_latency_ms: float = 0.0,
+    qr_process: subprocess.Popen | None = None,
 ) -> Stats:
     """Run latency measurement with specified capture method."""
     logger.info(f"\n{'=' * 60}")
@@ -230,21 +228,12 @@ def run_measurement(
     detector = cv2.QRCodeDetector()
     stats = Stats()
 
-    # Create window
-    cv2.namedWindow(QR_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(QR_WINDOW_NAME, QR_SIZE, QR_SIZE + 60)
-
     try:
-        # Warm up camera
+        # Warm up camera (this may include blocking operations like flushing)
         logger.info("Warming up camera...")
         for _ in range(30):
             cap.read()
         time.sleep(0.5)
-
-        # Initial QR display
-        warmup_frame = create_display_frame(time.perf_counter())
-        cv2.imshow(QR_WINDOW_NAME, warmup_frame)
-        cv2.waitKey(100)
 
         logger.info(f"Running measurement for {duration_s}s...")
         start_time = time.perf_counter()
@@ -257,18 +246,17 @@ def run_measurement(
             if elapsed >= duration_s:
                 break
 
-            # Display QR with current timestamp
-            t_display = time.perf_counter()
-            display_frame = create_display_frame(t_display)
-            cv2.imshow(QR_WINDOW_NAME, display_frame)
-
+            # Check for quit key
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
 
             # Capture frame
-            t_recv = time.perf_counter()
             frame = read_frame(cap, method)
+            # Record time AFTER reading frame (not before!) because flush methods
+            # take time and we want the time when the frame is actually available
+            # Use time.time() (wall-clock) to match QR display timestamps across processes
+            t_recv = time.time()
 
             if frame is None:
                 stats.add_failed()
@@ -305,6 +293,7 @@ def run_measurement(
 
     finally:
         cap.release()
+        # Note: QR process cleanup is handled by caller
 
     return stats
 
@@ -433,60 +422,79 @@ def main():
     )
     logger.info(f"Duration per method: {args.duration}s")
 
+    # Start rolling QR display process (runs indefinitely until terminated)
+    qr_process = None
+    try:
+        qr_process = start_rolling_qr_process(fps=args.fps)
+    except Exception as e:
+        logger.error(f"Failed to start rolling QR display: {e}")
+        raise
+
     results: dict[CaptureMethod, Stats] = {}
 
-    for method in methods:
-        try:
-            stats = run_measurement(
-                camera_index=args.camera,
-                width=args.width,
-                height=args.height,
-                fps=args.fps,
-                duration_s=args.duration,
-                method=method,
-                display_latency_ms=args.display_latency,
-            )
-            results[method] = stats
-
-            # Print individual results
-            summary = stats.summary()
-            print(f"\n{method.value}: ", end="")
-            if summary["count"] > 0:
-                print(
-                    f"mean={summary['mean_ms']:.1f}ms, "
-                    f"min={summary['min_ms']:.1f}ms, "
-                    f"max={summary['max_ms']:.1f}ms"
+    try:
+        for method in methods:
+            try:
+                stats = run_measurement(
+                    camera_index=args.camera,
+                    width=args.width,
+                    height=args.height,
+                    fps=args.fps,
+                    duration_s=args.duration,
+                    method=method,
+                    display_latency_ms=args.display_latency,
+                    qr_process=qr_process,
                 )
-            else:
-                print("No successful measurements")
+                results[method] = stats
 
-            # Brief pause between methods
-            time.sleep(1.0)
+                # Print individual results
+                summary = stats.summary()
+                print(f"\n{method.value}: ", end="")
+                if summary["count"] > 0:
+                    print(
+                        f"mean={summary['mean_ms']:.1f}ms, "
+                        f"min={summary['min_ms']:.1f}ms, "
+                        f"max={summary['max_ms']:.1f}ms"
+                    )
+                else:
+                    print("No successful measurements")
 
-        except Exception as e:
-            logger.error(f"Method {method.value} failed: {e}")
-            results[method] = Stats()
+                # Brief pause between methods
+                time.sleep(1.0)
 
-    cv2.destroyAllWindows()
+            except Exception as e:
+                logger.error(f"Method {method.value} failed: {e}")
+                results[method] = Stats()
 
-    # Print comparison
-    if len(results) > 1:
-        print_comparison(results)
-    elif len(results) == 1:
-        method, stats = next(iter(results.items()))
-        summary = stats.summary()
-        print("\n" + "=" * 50)
-        print(f"RESULTS: {method.value}")
-        print("=" * 50)
-        if summary["count"] > 0:
-            print(f"  Samples:  {summary['count']}")
-            print(f"  Failed:   {summary['failed']}")
-            print(f"  Mean:     {summary['mean_ms']:.2f}ms")
-            print(f"  Std:      {summary['std_ms']:.2f}ms")
-            print(f"  Min:      {summary['min_ms']:.2f}ms")
-            print(f"  Max:      {summary['max_ms']:.2f}ms")
-            print(f"  Median:   {summary['median_ms']:.2f}ms")
-            print(f"  P95:      {summary['p95_ms']:.2f}ms")
+        # Print comparison
+        if len(results) > 1:
+            print_comparison(results)
+        elif len(results) == 1:
+            method, stats = next(iter(results.items()))
+            summary = stats.summary()
+            print("\n" + "=" * 50)
+            print(f"RESULTS: {method.value}")
+            print("=" * 50)
+            if summary["count"] > 0:
+                print(f"  Samples:  {summary['count']}")
+                print(f"  Failed:   {summary['failed']}")
+                print(f"  Mean:     {summary['mean_ms']:.2f}ms")
+                print(f"  Std:      {summary['std_ms']:.2f}ms")
+                print(f"  Min:      {summary['min_ms']:.2f}ms")
+                print(f"  Max:      {summary['max_ms']:.2f}ms")
+                print(f"  Median:   {summary['median_ms']:.2f}ms")
+                print(f"  P95:      {summary['p95_ms']:.2f}ms")
+    finally:
+        # Cleanup QR process
+        if qr_process is not None:
+            logger.info("Stopping rolling QR display process...")
+            qr_process.terminate()
+            try:
+                qr_process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                logger.warning("QR process didn't terminate, killing...")
+                qr_process.kill()
+                qr_process.wait()
 
 
 if __name__ == "__main__":

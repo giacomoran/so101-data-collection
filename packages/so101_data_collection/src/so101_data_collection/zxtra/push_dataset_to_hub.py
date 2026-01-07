@@ -3,7 +3,7 @@
 Push a locally saved dataset to HuggingFace Hub.
 
 Usage:
-    python -m src.push_to_hub --dataset-name cube_hand_guided
+    python -m src.push_to_hub --repo-id giacomoran/so101_data_collection_cube_hand_guided
 """
 
 from __future__ import annotations
@@ -16,28 +16,27 @@ from pathlib import Path
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from so101_data_collection.collect.collect import DEFAULT_DATASET_ROOT
-from so101_data_collection.shared.setup import HF_REPO_ID
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def push_dataset_to_hub(
-    dataset_name: str, dataset_root: Path = DEFAULT_DATASET_ROOT
+    repo_id: str, dataset_root: Path = DEFAULT_DATASET_ROOT
 ) -> None:
-    """Push a dataset to HuggingFace Hub."""
-    dataset_path = dataset_root / dataset_name
+    """
+    Push a dataset to HuggingFace Hub.
+
+    Args:
+        repo_id: Full HuggingFace repo_id (e.g., 'giacomoran/so101_data_collection_cube_hand_guided')
+        dataset_root: Root directory containing datasets
+    """
+    # The dataset is stored at dataset_root / repo_id
+    dataset_path = dataset_root / repo_id
 
     if not dataset_path.exists():
         logger.error(f"Dataset directory not found: {dataset_path}")
         sys.exit(1)
-
-    # Enforce naming convention: HuggingFace repo names should use underscores, not hyphens
-    assert "-" not in HF_REPO_ID, (
-        f"HF_REPO_ID '{HF_REPO_ID}' contains hyphens. "
-        "Use underscores instead (e.g., 'user_name/repo_name')."
-    )
-    repo_id = f"{HF_REPO_ID}_{dataset_name}"
 
     logger.info(f"Loading dataset from: {dataset_path}")
     logger.info(f"Pushing to HuggingFace Hub: {repo_id}")
@@ -62,10 +61,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--dataset-name",
+        "--repo-id",
         type=str,
         required=True,
-        help="Name of the dataset directory in /data (e.g., 'cube_hand_guided')",
+        help="Full HuggingFace repo_id (e.g., 'giacomoran/so101_data_collection_cube_hand_guided')",
     )
     parser.add_argument(
         "--dataset-root",
@@ -79,7 +78,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    push_dataset_to_hub(args.dataset_name, args.dataset_root)
+    push_dataset_to_hub(args.repo_id, args.dataset_root)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,3 @@ TOP_CAMERA_INDEX: int = 0
 # Camera resolution
 CAMERA_WIDTH: int = 640
 CAMERA_HEIGHT: int = 480
-
-# HuggingFace dataset repository (use underscores, not hyphens)
-HF_REPO_ID: str = "giacomoran/so101_data_collection"

@@ -2,8 +2,8 @@
 """
 Camera latency measurement script following UMI paper methodology.
 
-Displays a rolling QR code with the current timestamp on screen, captures it
-with the camera, and calculates end-to-end latency by decoding the QR code.
+Captures rolling QR codes displayed on screen and calculates end-to-end latency
+by decoding the QR code timestamps.
 
 Latency formula: l_camera = t_recv - t_display - l_display
 
@@ -11,6 +11,8 @@ Where:
 - t_recv: timestamp when frame is received from camera
 - t_display: timestamp encoded in QR code (when it was generated)
 - l_display: known monitor refresh latency (configurable)
+
+The rolling QR code display is automatically started as a separate process.
 
 Usage:
     python -m src.latency.measure_camera --camera 1 --duration 10
@@ -20,8 +22,8 @@ from __future__ import annotations
 
 import argparse
 import csv
-import io
 import logging
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -29,7 +31,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import qrcode
 from lerobot.cameras.opencv import OpenCVCamera
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
@@ -41,10 +42,6 @@ from so101_data_collection.shared.setup import (
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# QR code display settings
-QR_WINDOW_NAME = "Latency Measurement - QR Code"
-QR_SIZE = 800  # Size of QR code display in pixels
 
 
 @dataclass
@@ -117,75 +114,6 @@ class LatencyStats:
         }
 
 
-def generate_qr_image(data: str, size: int = QR_SIZE) -> np.ndarray:
-    """
-    Generate a QR code image as a numpy array.
-
-    Args:
-        data: String data to encode
-        size: Output image size in pixels
-
-    Returns:
-        BGR image as numpy array
-    """
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(data)
-    qr.make(fit=True)
-
-    # Create PIL image
-    img = qr.make_image(fill_color="black", back_color="white")
-
-    # Convert to numpy array
-    img_array = np.array(img.convert("RGB"))
-
-    # Resize to desired size
-    img_resized = cv2.resize(img_array, (size, size), interpolation=cv2.INTER_NEAREST)
-
-    # Convert RGB to BGR for OpenCV
-    img_bgr = cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR)
-
-    return img_bgr
-
-
-def create_display_frame(timestamp: float, qr_size: int = QR_SIZE) -> np.ndarray:
-    """
-    Create a display frame with QR code encoding the timestamp.
-
-    The frame includes:
-    - Large QR code with timestamp
-    - Text showing the encoded timestamp (for debugging)
-    """
-    # Generate QR code with timestamp
-    timestamp_str = f"{timestamp:.6f}"
-    qr_img = generate_qr_image(timestamp_str, qr_size)
-
-    # Create frame with padding for text
-    padding = 60
-    frame_h = qr_size + padding
-    frame_w = qr_size
-    frame = np.ones((frame_h, frame_w, 3), dtype=np.uint8) * 255
-
-    # Place QR code
-    frame[:qr_size, :qr_size] = qr_img
-
-    # Add timestamp text below QR code
-    text = f"t={timestamp_str}"
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.5
-    thickness = 1
-    text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
-    text_x = (frame_w - text_size[0]) // 2
-    text_y = qr_size + 35
-    cv2.putText(frame, text, (text_x, text_y), font, font_scale, (0, 0, 0), thickness)
-
-    return frame
-
-
 def decode_qr(
     image: np.ndarray, detector: cv2.QRCodeDetector
 ) -> tuple[str | None, np.ndarray | None]:
@@ -201,6 +129,44 @@ def decode_qr(
     return None, None
 
 
+def start_rolling_qr_process(fps: float = 30.0) -> subprocess.Popen:
+    """
+    Start the rolling QR code display as a separate process.
+
+    The QR display will run indefinitely until terminated.
+
+    Args:
+        fps: Frame rate for QR display
+
+    Returns:
+        Popen process object for the QR display
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "so101_data_collection.shared.rolling_qr",
+        "--fps",
+        str(fps),
+        # No --duration flag - runs indefinitely until terminated
+    ]
+    logger.info(f"Starting rolling QR display process: {' '.join(cmd)}")
+    # Don't redirect stdout/stderr - GUI windows need direct access to the display
+    # on macOS. Redirecting them prevents the window from appearing.
+    # Let stdout/stderr go to the terminal so the GUI can work properly.
+    process = subprocess.Popen(cmd)
+    # Give it a moment to initialize and create the window
+    time.sleep(1.0)
+    if process.poll() is not None:
+        # Process exited early - try to get error info
+        returncode = process.returncode
+        raise RuntimeError(
+            f"QR display process exited early with return code {returncode}. "
+            f"Check that OpenCV can create windows and that no other QR display is running."
+        )
+    logger.info("Rolling QR display started successfully")
+    return process
+
+
 def measure_latency(config: MeasureConfig) -> LatencyStats:
     """
     Run latency measurement.
@@ -210,6 +176,14 @@ def measure_latency(config: MeasureConfig) -> LatencyStats:
     logger.info(f"Starting latency measurement for {config.duration_s}s")
     logger.info(f"Camera index: {config.camera_index}, FPS: {config.fps}")
     logger.info(f"Display latency compensation: {config.display_latency_ms}ms")
+
+    # Start rolling QR display process (runs indefinitely until terminated)
+    qr_process = None
+    try:
+        qr_process = start_rolling_qr_process(fps=config.fps)
+    except Exception as e:
+        logger.error(f"Failed to start rolling QR display: {e}")
+        raise
 
     # Initialize camera
     cam_config = OpenCVCameraConfig(
@@ -238,10 +212,6 @@ def measure_latency(config: MeasureConfig) -> LatencyStats:
         )
         logger.info(f"Recording debug video to: {config.save_video}")
 
-    # Create display window
-    cv2.namedWindow(QR_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(QR_WINDOW_NAME, QR_SIZE, QR_SIZE + 60)
-
     try:
         # Connect camera
         camera.connect()
@@ -249,10 +219,6 @@ def measure_latency(config: MeasureConfig) -> LatencyStats:
         logger.info("Point camera at the QR code window on your monitor")
         logger.info("Press 'q' to stop early")
 
-        # Warm-up: display initial QR and wait for camera to stabilize
-        warmup_frame = create_display_frame(time.perf_counter())
-        cv2.imshow(QR_WINDOW_NAME, warmup_frame)
-        cv2.waitKey(1)
         time.sleep(0.5)  # Let camera auto-exposure settle
 
         start_time = time.perf_counter()
@@ -266,11 +232,6 @@ def measure_latency(config: MeasureConfig) -> LatencyStats:
             if elapsed >= config.duration_s:
                 break
 
-            # Generate and display QR code with current timestamp
-            t_display = time.perf_counter()
-            display_frame = create_display_frame(t_display)
-            cv2.imshow(QR_WINDOW_NAME, display_frame)
-
             # Check for quit key
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -278,8 +239,10 @@ def measure_latency(config: MeasureConfig) -> LatencyStats:
                 break
 
             # Capture frame from camera (same pattern as collect.py)
-            t_recv = time.perf_counter()
             frame = camera.async_read()
+            # Record time AFTER reading frame so we capture when the frame is available
+            # Use time.time() (wall-clock) to match QR display timestamps across processes
+            t_recv = time.time()
 
             if frame is None:
                 logger.warning("Camera returned None frame")
@@ -292,7 +255,7 @@ def measure_latency(config: MeasureConfig) -> LatencyStats:
             if decoded_data:
                 try:
                     t_qr = float(decoded_data)
-                    # Calculate latency: t_recv - t_display - l_display
+                    # Calculate latency: t_recv - t_qr - l_display
                     latency_ms = (t_recv - t_qr) * 1000 - config.display_latency_ms
 
                     measurement = LatencyMeasurement(
@@ -363,10 +326,21 @@ def measure_latency(config: MeasureConfig) -> LatencyStats:
 
     finally:
         # Cleanup
-        camera.disconnect()
+        if camera.is_connected:
+            camera.disconnect()
         cv2.destroyAllWindows()
         if video_writer:
             video_writer.release()
+        # Terminate QR display process
+        if qr_process is not None:
+            logger.info("Stopping rolling QR display process...")
+            qr_process.terminate()
+            try:
+                qr_process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                logger.warning("QR process didn't terminate, killing...")
+                qr_process.kill()
+                qr_process.wait()
 
     return stats
 
