@@ -578,12 +578,16 @@ def create_cameras(
 def get_observation_features(
     cameras: dict[str, FlushingCameraCapture],
 ) -> dict[str, Any]:
-    """Get observation features for dataset creation."""
+    """Get observation features for dataset creation.
+
+    IMPORTANT: State names must include '.pos' suffix to match the format
+    used by lerobot-record (SO101Follower.observation_features uses '.pos').
+    """
     features = {
         "observation.state": {
             "dtype": "float32",
             "shape": (6,),
-            "names": list(MOTOR_NAMES),
+            "names": [f"{name}.pos" for name in MOTOR_NAMES],
         }
     }
 
@@ -598,12 +602,17 @@ def get_observation_features(
 
 
 def get_action_features() -> dict[str, Any]:
-    """Get action features for dataset creation."""
+    """Get action features for dataset creation.
+
+    IMPORTANT: Action names must include '.pos' suffix so that lerobot-replay
+    creates action dicts with keys like 'shoulder_pan.pos', which is what
+    robot.send_action() expects (see so101_follower.py line 209).
+    """
     return {
         "action": {
             "dtype": "float32",
             "shape": (6,),
-            "names": list(MOTOR_NAMES),
+            "names": [f"{name}.pos" for name in MOTOR_NAMES],
         }
     }
 

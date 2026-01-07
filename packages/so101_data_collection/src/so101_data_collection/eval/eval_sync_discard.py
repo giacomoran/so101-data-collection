@@ -471,9 +471,9 @@ def run_episode_sync_discard(
             action_tensor = action_tensor.cpu()
 
             # Convert action tensor to robot action dict
-            # make_robot_action returns keys like "shoulder_pan", but robot expects "shoulder_pan.pos"
-            action_dict = make_robot_action(action_tensor, ds_features)
-            robot_action = {f"{name}.pos": val for name, val in action_dict.items()}
+            # make_robot_action uses ds_features[ACTION]["names"] to build keys
+            # If dataset action names include '.pos' suffix, robot_action is ready to use
+            robot_action = make_robot_action(action_tensor, ds_features)
 
             # Log to rerun
             if cfg.display_data:
