@@ -52,11 +52,14 @@ class ACTRelativeRTCConfig(PreTrainedConfig):
         n_action_steps: The number of action steps to run in the environment for one invocation.
         obs_state_delta_frames: Number of frames back for computing observation state delta.
         use_rtc: Enable Real-Time Chunking (training-time smoothing). Reserved for future use.
+        downscale_img_square: Target square resolution for image preprocessing. If None, no resizing.
         ... (other args same as ACTConfig)
     """
 
     # Input / output structure.
-    n_obs_steps: int = 2  # Kept for backward compatibility, but see obs_state_delta_frames
+    n_obs_steps: int = (
+        2  # Kept for backward compatibility, but see obs_state_delta_frames
+    )
     chunk_size: int = 100
     n_action_steps: int = 100
 
@@ -70,6 +73,17 @@ class ACTRelativeRTCConfig(PreTrainedConfig):
     # Real-Time Chunking (RTC) - reserved for future implementation
     # When enabled, will apply training-time smoothing to reduce discontinuities at chunk boundaries
     use_rtc: bool = False
+
+    # Debug flag to skip relative stats computation during training initialization
+    # When True, skips the 2-minute relative stats computation step (useful for debugging)
+    # Note: Stats will still be loaded from checkpoints if available
+    skip_compute_relative_stats: bool = False
+
+    # Image preprocessing
+    # If specified, images are first padded to square with black borders, then downscaled
+    # to the target resolution using area interpolation. For example, setting to 224 will
+    # resize all images to 224x224. If None, no transformation is applied.
+    downscale_img_square: int | None = None
 
     # Normalization configuration for ACT Relative:
     #
@@ -211,4 +225,3 @@ class ACTRelativeRTCConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
-

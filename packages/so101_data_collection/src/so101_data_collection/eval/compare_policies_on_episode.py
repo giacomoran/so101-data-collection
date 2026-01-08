@@ -271,6 +271,7 @@ class ComparePoliciesConfig:
     dataset_repo_id: str = "giacomoran/so101_data_collection_cube_hand_guided"
     dataset_episode_idx: list[int] = field(default_factory=lambda: [0])
     device: str | None = None
+    plot_interval: float = 1.0
 
     def __post_init__(self):
         if not self.policy_paths:
@@ -421,8 +422,8 @@ def run_comparison_for_episode(
             for dim in range(action_dim):
                 per_dim_errors[name][dim].append(error[:, dim].mean())
 
-            # Store chunks at each second
-            if local_idx % int(fps) == 0:
+            # Store chunks at each interval
+            if local_idx % int(fps * cfg.plot_interval) == 0:
                 second_chunks_predicted[name].append((local_idx, pred_chunk.copy()))
 
         if local_idx % 100 == 0:
@@ -463,34 +464,22 @@ def run_comparison_for_episode(
     # === Create Plots ===
     logging.info(f"\n📊 Generating plots for episode {episode_idx}...")
 
-    # Build concatenated predictions for each policy
-    concatenated_preds = {}
-    for name in policy_names:
-        concatenated_pred = np.full((num_frames, action_dim), np.nan)
-        for start_frame, pred_chunk in second_chunks_predicted[name]:
-            end_frame = min(start_frame + chunk_size, num_frames)
-            chunk_len = end_frame - start_frame
-            concatenated_pred[start_frame:end_frame] = pred_chunk[:chunk_len]
-        concatenated_preds[name] = concatenated_pred
-
     # Color palette for policies
     colors = plt.cm.tab10(np.linspace(0, 1, len(policy_names)))
 
-    # Plot 1: Action comparison per joint
-    fig, axes = plt.subplots(
-        action_dim, 1, figsize=(14, 2.5 * action_dim), squeeze=False
-    )
-    axes = axes[:, 0]
+    # Create 4x2 grid plot
+    fig, axes = plt.subplots(4, 2, figsize=(16, 12))
+    axes = axes.flatten()
 
     fig.suptitle(
         f"Action Comparison: {len(policy_names)} Policies vs Ground Truth\n"
         f"Dataset: {cfg.dataset_repo_id}, Episode: {episode_idx}",
         fontsize=14,
-        y=1.01,
     )
 
     time_axis = np.arange(num_frames) / fps
 
+    # First subplots: action comparison for all joints
     for dim in range(action_dim):
         ax = axes[dim]
         dim_name = dim_names[dim] if dim < len(dim_names) else f"dim_{dim}"
@@ -499,56 +488,57 @@ def run_comparison_for_episode(
         ax.plot(
             time_axis,
             gt_actions_episode[:, dim],
-            "k-",
+            "gray",
             label="Ground Truth",
-            linewidth=2,
-            alpha=0.9,
+            linewidth=1.0,
+            alpha=0.3,
         )
 
-        # Each policy's predictions
+        # Plot each chunk separately for each policy
         for i, name in enumerate(policy_names):
             short_name = name.split("/")[-1].split(" ")[0][:15]
-            ax.plot(
-                time_axis,
-                concatenated_preds[name][:, dim],
-                "--",
-                color=colors[i],
-                label=short_name,
-                linewidth=1.5,
-                alpha=0.8,
-            )
+            for start_frame, pred_chunk in second_chunks_predicted[name]:
+                chunk_time = np.arange(start_frame, start_frame + len(pred_chunk)) / fps
+                ax.plot(
+                    chunk_time,
+                    pred_chunk[:, dim],
+                    "--",
+                    color=colors[i],
+                    linewidth=1,
+                    alpha=0.5,
+                )
+            # Add legend entry
+            ax.plot([], [], "--", color=colors[i], label=short_name)
 
-        ax.set_title(dim_name, fontsize=11, fontweight="bold")
-        ax.set_xlabel("Time (seconds)", fontsize=10)
-        ax.set_ylabel("Action value", fontsize=10)
-        ax.legend(fontsize=8, loc="best", ncol=min(len(policy_names) + 1, 4))
+        ax.set_title(dim_name, fontsize=10, fontweight="bold")
+        ax.set_xlabel("Time (s)", fontsize=8)
+        ax.set_ylabel("Action", fontsize=8)
+        ax.legend(fontsize=7, loc="best", ncol=min(len(policy_names) + 1, 3))
         ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=8)
 
-    plt.tight_layout()
-
-    # Plot 2: Error comparison over time
-    fig2, axes2 = plt.subplots(2, 1, figsize=(14, 8))
-
-    ax1 = axes2[0]
+    # Next subplot: error over time
+    ax = axes[action_dim]
     for i, name in enumerate(policy_names):
         short_name = name.split("/")[-1].split(" ")[0][:15]
         errors = np.array(all_chunk_errors[name])
-        ax1.plot(
+        ax.plot(
             time_axis,
             errors,
             color=colors[i],
             linewidth=1,
             alpha=0.7,
-            label=f"{short_name} (mean: {errors.mean():.4f})",
+            label=f"{short_name}",
         )
-    ax1.set_xlabel("Time (seconds)")
-    ax1.set_ylabel("Mean L1 Error (per chunk)")
-    ax1.set_title("Action Prediction Error Over Time")
-    ax1.legend(fontsize=9)
-    ax1.grid(True, alpha=0.3)
+    ax.set_xlabel("Time (s)", fontsize=8)
+    ax.set_ylabel("Mean L1 Error", fontsize=8)
+    ax.set_title("Error Over Time", fontsize=10, fontweight="bold")
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(labelsize=8)
 
-    # Per-dimension error comparison (bar chart)
-    ax2 = axes2[1]
+    # Last subplot: per-dimension error comparison (bar chart)
+    ax = axes[action_dim + 1]
     x = np.arange(action_dim)
     width = 0.8 / len(policy_names)
 
@@ -557,7 +547,7 @@ def run_comparison_for_episode(
         dim_means = [
             np.array(per_dim_errors[name][d]).mean() for d in range(action_dim)
         ]
-        ax2.bar(
+        ax.bar(
             x + i * width - 0.4 + width / 2,
             dim_means,
             width,
@@ -566,13 +556,14 @@ def run_comparison_for_episode(
             alpha=0.8,
         )
 
-    ax2.set_xlabel("Joint")
-    ax2.set_ylabel("Mean L1 Error")
-    ax2.set_title("Per-Dimension Error Comparison")
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(dim_names)
-    ax2.legend(fontsize=9)
-    ax2.grid(True, alpha=0.3, axis="y")
+    ax.set_xlabel("Joint", fontsize=8)
+    ax.set_ylabel("Mean L1 Error", fontsize=8)
+    ax.set_title("Per-Dimension Error", fontsize=10, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(dim_names)
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.tick_params(labelsize=8)
 
     plt.tight_layout()
 

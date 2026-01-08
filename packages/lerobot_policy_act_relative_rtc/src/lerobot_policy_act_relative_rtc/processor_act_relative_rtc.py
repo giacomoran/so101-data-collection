@@ -21,13 +21,17 @@ The relative position transformations are handled in the model's forward pass,
 not in the processor.
 """
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torchvision.transforms.functional as F
+from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
     NormalizerProcessorStep,
+    ObservationProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
@@ -37,12 +41,176 @@ from lerobot.processor.converters import (
     policy_action_to_transition,
     transition_to_policy_action,
 )
+from lerobot.processor.pipeline import ProcessorStepRegistry
 from lerobot.utils.constants import (
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
 from .configuration_act_relative_rtc import ACTRelativeRTCConfig
+
+
+@ProcessorStepRegistry.register("image_pad_square_resize_processor")
+@dataclass
+class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
+    """
+    Pads images to square with black borders and resizes to a specified resolution.
+
+    This step applies the following transformations to all image observations:
+    1. If downscale_img_square is None, do nothing.
+    2. Convert image to float32 if needed.
+    3. Pad the image with constant black borders to make it square.
+    4. Downscale the image using area interpolation to the desired resolution.
+
+    Attributes:
+        downscale_img_square: The target square resolution (e.g., 224 for 224x224).
+                              If None, no transformation is applied.
+    """
+
+    downscale_img_square: int | None = None
+
+    def observation(self, observation: dict) -> dict:
+        """
+        Applies padding and resizing to all images in the observation dictionary.
+
+        Args:
+            observation: The observation dictionary containing image tensors.
+                         Images can have shape (C, H, W), (T, C, H, W), (B, T, C, H, W), etc.
+
+        Returns:
+            A new observation dictionary with transformed images.
+        """
+        if self.downscale_img_square is None:
+            return observation
+
+        new_observation = dict(observation)
+
+        # Process all image keys in the observation
+        for key in observation:
+            if "image" not in key:
+                continue
+
+            image = observation[key]
+
+            # Ensure image is float32 tensor (interpolate requires float)
+            if not isinstance(image, torch.Tensor):
+                image = torch.tensor(image)
+            if image.dtype != torch.float32:
+                if image.dtype == torch.uint8:
+                    image = image.float() / 255.0
+                else:
+                    image = image.float()
+
+            device = image.device
+            original_shape = image.shape
+            original_ndim = len(original_shape)
+
+            # Normalize to (N, C, H, W) format for processing
+            # Store shape info for restoration
+            shape_info = None
+            if original_ndim == 2:
+                # (H, W) -> (1, 1, H, W)
+                image = image.unsqueeze(0).unsqueeze(0)
+                shape_info = ("2d",)
+            elif original_ndim == 3:
+                # (C, H, W) -> (1, C, H, W)
+                image = image.unsqueeze(0)
+                shape_info = ("3d",)
+            elif original_ndim == 4:
+                # (T, C, H, W) or (N, C, H, W) -> already correct
+                shape_info = ("4d",)
+            elif original_ndim == 5:
+                # (B, T, C, H, W) -> flatten to (B*T, C, H, W)
+                B, T, C, H, W = image.shape
+                image = image.view(B * T, C, H, W)
+                shape_info = ("5d", B, T)
+            else:
+                raise ValueError(
+                    f"Unexpected image shape: {image.shape} (expected 2-5 dimensions)"
+                )
+
+            # Now image is (N, C, H, W)
+            N, C, H, W = image.shape
+
+            # Pad to square
+            max_dim = max(H, W)
+            pad_h = max_dim - H
+            pad_w = max_dim - W
+            padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
+
+            # Move to CPU for interpolation if on MPS (MPS has issues with some operations)
+            is_mps = device.type == "mps"
+            if is_mps:
+                image = image.cpu()
+
+            # Pad to square
+            image = F.pad(image, padding, fill=0, padding_mode="constant")
+
+            # Resize using interpolate
+            if self.downscale_img_square > 0:
+                image = torch.nn.functional.interpolate(
+                    image,
+                    size=(self.downscale_img_square, self.downscale_img_square),
+                    mode="area",
+                )
+
+            # Restore original shape
+            if shape_info[0] == "2d":
+                image = image.squeeze(0).squeeze(0)
+            elif shape_info[0] == "3d":
+                image = image.squeeze(0)
+            elif shape_info[0] == "4d":
+                pass  # Already correct shape
+            elif shape_info[0] == "5d":
+                _, B, T = shape_info
+                image = image.view(B, T, C, image.shape[-2], image.shape[-1])
+
+            # Move back to original device
+            if is_mps:
+                image = image.to(device)
+
+            new_observation[key] = image
+
+        return new_observation
+
+    def get_config(self) -> dict[str, Any]:
+        """
+        Returns the configuration of the step for serialization.
+
+        Returns:
+            A dictionary containing the downscale_img_square parameter.
+        """
+        return {
+            "downscale_img_square": self.downscale_img_square,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """
+        Updates the image feature shapes if resizing is applied.
+
+        Args:
+            features: The policy features dictionary.
+
+        Returns:
+            The updated policy features dictionary with new image shapes.
+        """
+        if self.downscale_img_square is None:
+            return features
+
+        for key in features[PipelineFeatureType.OBSERVATION]:
+            if "image" in key:
+                nb_channel = features[PipelineFeatureType.OBSERVATION][key].shape[0]
+                features[PipelineFeatureType.OBSERVATION][key] = PolicyFeature(
+                    type=features[PipelineFeatureType.OBSERVATION][key].type,
+                    shape=(
+                        nb_channel,
+                        self.downscale_img_square,
+                        self.downscale_img_square,
+                    ),
+                )
+        return features
 
 
 def make_act_relative_rtc_pre_post_processors(
@@ -70,6 +238,9 @@ def make_act_relative_rtc_pre_post_processors(
 
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
+        ImagePadSquareResizeProcessorStep(
+            downscale_img_square=config.downscale_img_square
+        ),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
         NormalizerProcessorStep(
@@ -100,4 +271,3 @@ def make_act_relative_rtc_pre_post_processors(
             to_output=transition_to_policy_action,
         ),
     )
-

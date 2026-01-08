@@ -153,10 +153,12 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         # When loading from pretrained (e.g., lerobot-record for evaluation), stats are
         # loaded from the checkpoint AFTER __init__, so we skip computing here.
         # We detect this by checking if pretrained_path is set in config.
+        # Can also be skipped via skip_compute_relative_stats flag (useful for debugging).
         if (
             dataset_meta is not None
             and not self.has_relative_stats
             and self.config.pretrained_path is None
+            and not self.config.skip_compute_relative_stats
         ):
             self._compute_and_set_relative_stats(dataset_meta)
 
