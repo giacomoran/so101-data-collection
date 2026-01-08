@@ -469,8 +469,9 @@ def run_episode_sync_discard(
             # actions_to_execute shape: [batch, n_actions, action_dim]
             action_tensor = actions_to_execute[:, action_idx, :]  # [batch, action_dim]
 
-            # Move to CPU for robot action conversion
-            action_tensor = action_tensor.cpu()
+            # Apply postprocessor (matches lerobot-record behavior)
+            # This handles any final transformations and ensures consistency
+            action_tensor = postprocessor(action_tensor)
 
             # Convert action tensor to robot action dict
             # make_robot_action uses ds_features[ACTION]["names"] to build keys
@@ -487,6 +488,20 @@ def run_episode_sync_discard(
             robot.send_action(robot_action)
 
             total_actions_executed += 1
+
+            # Update observation queue after executing each action
+            # Ensures that queue advances with each action step, matching select_action behavior
+            # In lerobot-record, select_action is called every step and updates the queue each time.
+            # Here we need to manually update the queue after each action to maintain the same behavior.
+            # Get fresh observation after action execution
+            raw_obs_after = robot.get_observation()
+            state_values_after = [
+                raw_obs_after[motor_name] for motor_name in motor_names
+            ]
+            obs_state_after = torch.tensor(
+                np.array(state_values_after, dtype=np.float32), device=device
+            ).unsqueeze(0)  # Add batch dimension [1, state_dim]
+            obs_queue.update(obs_state_after)
 
             # Sleep to maintain target fps
             action_duration = time.perf_counter() - action_start_t
