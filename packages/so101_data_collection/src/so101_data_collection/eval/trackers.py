@@ -24,8 +24,8 @@ class LatencyTracker:
         with self.lock:
             self.latencies_ms.append(latency_ms)
             if log_to_rerun:
-                rr.set_time("inference_idx", sequence=self.chunk_idx)
-                rr.log("metrics/inference_latency", rr.Scalars(latency_ms))
+                # Use slash-separated paths for blueprint matching
+                rr.log("/metrics/inference_latency", rr.Scalars(latency_ms))
             self.chunk_idx += 1
 
     def get_stats(self) -> dict:
@@ -62,14 +62,15 @@ class LatencyTracker:
 - P50: {stats["p50"]:.1f}ms
 - P95: {stats["p95"]:.1f}ms
 """
+            # Use slash-separated paths for blueprint matching
             rr.log(
-                "metrics/latency_summary",
+                "/metrics/latency_summary",
                 rr.TextDocument(summary_text, media_type=rr.MediaType.MARKDOWN),
             )
 
             # Log histogram
             hist, _ = np.histogram(self.latencies_ms, bins=20)
-            rr.log("metrics/latency_histogram", rr.BarChart(hist))
+            rr.log("/metrics/latency_histogram", rr.BarChart(hist))
 
     def reset(self) -> None:
         """Reset tracker for a new episode."""
@@ -91,8 +92,8 @@ class DiscardTracker:
         with self.lock:
             self.discarded_counts.append(n_discarded)
             if log_to_rerun:
-                rr.set_time("inference_idx", sequence=self.chunk_idx)
-                rr.log("metrics/discarded_actions", rr.Scalars(n_discarded))
+                # Use slash-separated paths for blueprint matching
+                rr.log("/metrics/discarded_actions", rr.Scalars(n_discarded))
             self.chunk_idx += 1
 
     def get_stats(self) -> dict:
@@ -127,8 +128,9 @@ class DiscardTracker:
 - Min: {stats["min"]}
 - Max: {stats["max"]}
 """
+            # Use slash-separated paths for blueprint matching
             rr.log(
-                "metrics/discard_summary",
+                "/metrics/discard_summary",
                 rr.TextDocument(summary_text, media_type=rr.MediaType.MARKDOWN),
             )
 
@@ -138,7 +140,7 @@ class DiscardTracker:
                     self.discarded_counts,
                     bins=min(20, max(self.discarded_counts) + 1),
                 )
-                rr.log("metrics/discard_histogram", rr.BarChart(hist))
+                rr.log("/metrics/discard_histogram", rr.BarChart(hist))
 
     def reset(self) -> None:
         """Reset tracker for a new episode."""

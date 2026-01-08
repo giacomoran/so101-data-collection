@@ -67,9 +67,10 @@ from lerobot.utils.control_utils import (
 )
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import init_rerun
 from lerobot_policy_act_relative_rtc import ACTRelativeRTCConfig  # noqa: F401
 
+from so101_data_collection.eval.rerun_utils import log_rerun_data
 from so101_data_collection.eval.trackers import DiscardTracker, LatencyTracker
 
 # ============================================================================
@@ -601,7 +602,9 @@ def actor_thread_fn(
                 # Convert action tensor to robot action dict
                 # make_robot_action uses ds_features[ACTION]["names"] to build keys
                 # If dataset action names include '.pos' suffix, robot_action is ready to use
-                robot_action = make_robot_action(action_tensor.unsqueeze(0), ds_features)
+                robot_action = make_robot_action(
+                    action_tensor.unsqueeze(0), ds_features
+                )
 
                 # Log to rerun
                 if cfg.display_data:

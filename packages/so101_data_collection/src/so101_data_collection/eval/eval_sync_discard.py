@@ -60,9 +60,10 @@ from lerobot.utils.control_utils import (
 )
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import init_rerun
 from lerobot_policy_act_relative_rtc import ACTRelativeRTCConfig  # noqa: F401
 
+from so101_data_collection.eval.rerun_utils import log_rerun_data
 from so101_data_collection.eval.trackers import DiscardTracker, LatencyTracker
 
 # ============================================================================
@@ -557,9 +558,15 @@ def main(cfg: EvalDiscardConfig) -> None:
     logging.info(f"Loading policy from {cfg.policy.pretrained_path}...")
     policy = make_policy(cfg.policy, ds_meta=ds_meta, env_cfg=None)
 
+    # Override to ensure compatibility when loading models trained on different hardware
+    preprocessor_overrides = {
+        "device_processor": {"device": str(policy.config.device)},
+    }
+
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
+        preprocessor_overrides=preprocessor_overrides,
     )
 
     # Initialize keyboard listener

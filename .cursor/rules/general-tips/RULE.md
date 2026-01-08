@@ -20,3 +20,7 @@ When working with LeRobot datasets, refer to the official documentation:
 
 - **HuggingFace repos/datasets**: Use underscores `_` instead of hyphens `-` in names (e.g., `cube_hand_guided` not `cube-hand-guided`)
 - **Task names**: Use short names: `cube`, `gba`, `ball` (not `pick_place_cube`, `press_gba`, `throw_ball`)
+
+## Running Python scripts
+
+Remember that we use Nix, so you need `nix develop`, see flake.nix; and we are using uv, so you need to source the virtual environment at .venv.

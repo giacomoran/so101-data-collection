@@ -33,6 +33,7 @@ from pprint import pformat
 
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 import torch
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.configs import parser
@@ -53,10 +54,64 @@ from lerobot.utils.control_utils import (
 )
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import init_rerun
 from lerobot_policy_act_relative_rtc import ACTRelativeRTCConfig  # noqa: F401
 
+from so101_data_collection.eval.rerun_utils import log_rerun_data
 from so101_data_collection.eval.trackers import LatencyTracker
+
+# ============================================================================
+# ReRun Blueprint
+# ============================================================================
+
+
+def send_blueprint() -> None:
+    """Send ReRun blueprint for visualization layout.
+
+    Matches the actual paths logged by:
+    - log_rerun_data: /observation/state_*, /observation/images/*, /action/*/pos
+    - LatencyTracker: /metrics/inference_latency
+    """
+    rr.send_blueprint(
+        rrb.Blueprint(
+            rrb.Horizontal(
+                # Left: images
+                rrb.Spatial2DView(
+                    name="Images",
+                    origin="/observation/images",
+                    # Matches /observation/images/wrist, /observation/images/top, etc.
+                ),
+                # Right: time series split into two stacked panes
+                rrb.Vertical(
+                    rrb.TimeSeriesView(
+                        name="Actions + Observations",
+                        origin="/",
+                        contents=[
+                            # Actions: /action/shoulder_pan/pos, /action/shoulder_lift/pos, etc.
+                            "+ /action/**",
+                            # Observations: /observation/state_0, /observation/state_1, etc.
+                            # List all state indices explicitly to ensure matching
+                            "+ /observation/state_0",
+                            "+ /observation/state_1",
+                            "+ /observation/state_2",
+                            "+ /observation/state_3",
+                            "+ /observation/state_4",
+                            "+ /observation/state_5",
+                        ],
+                    ),
+                    rrb.TimeSeriesView(
+                        name="Metrics",
+                        origin="/metrics",
+                        # Matches metrics.inference_latency (ReRun handles dot-to-slash conversion)
+                        # default contents is "+ $origin/**"
+                    ),
+                    row_shares=[2, 1],
+                ),
+                column_shares=[2, 3],
+            )
+        )
+    )
+
 
 # ============================================================================
 # Configuration
@@ -293,14 +348,6 @@ def run_episode_sync(
     obs_state_delta_frames = getattr(policy.config, "obs_state_delta_frames", 1)
     obs_queue = ObservationQueue(obs_state_delta_frames)
 
-    # Setup rerun styling for latency plot (static, logged once)
-    if cfg.display_data:
-        rr.log(
-            "metrics/inference_latency",
-            rr.SeriesLines(names="Inference (ms)", colors=[255, 100, 100]),
-            static=True,
-        )
-
     # Get dataset features for action conversion
     ds_features = ds_meta.features
 
@@ -411,9 +458,17 @@ def run_episode_sync(
 
             # Log to rerun
             if cfg.display_data:
-                # Get fresh observation for visualization
-                vis_obs = robot.get_observation()
-                log_rerun_data(observation=vis_obs, action=robot_action)
+                raw_obs = robot.get_observation()
+                observation_frame = {}
+                state_values = [raw_obs[motor_name] for motor_name in motor_names]
+                observation_frame["observation.state"] = np.array(
+                    state_values, dtype=np.float32
+                )
+                for cam_name in camera_names:
+                    observation_frame[f"observation.images.{cam_name}"] = raw_obs[
+                        cam_name
+                    ]
+                log_rerun_data(observation=observation_frame, action=robot_action)
 
             # Send action to robot
             robot.send_action(robot_action)
@@ -463,6 +518,7 @@ def main(cfg: EvalConfig) -> None:
     # Initialize rerun if displaying data
     if cfg.display_data:
         init_rerun(session_name="eval_sync")
+        send_blueprint()
 
     # Setup device
     device = get_safe_torch_device(cfg.policy.device)
@@ -482,15 +538,22 @@ def main(cfg: EvalConfig) -> None:
     logging.info(f"Loading policy from {cfg.policy.pretrained_path}...")
     policy = make_policy(cfg.policy, ds_meta=ds_meta, env_cfg=None)
 
+    # Override the device processor to use the detected device (cuda/cpu/mps)
+    # This ensures compatibility when loading models trained on different hardware
+    preprocessor_overrides = {
+        "device_processor": {"device": str(policy.config.device)},
+    }
+
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
+        preprocessor_overrides=preprocessor_overrides,
     )
 
     # Initialize keyboard listener
     listener, events = init_keyboard_listener()
 
-    # Create latency tracker
+    # Create latency tracker (using slash paths for blueprint matching)
     latency_tracker = LatencyTracker()
 
     try:
