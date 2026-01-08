@@ -259,6 +259,7 @@ def run_inference_chunk(
         # Step 7: Convert to absolute actions
         # relative_actions: [batch, n_action_steps, action_dim]
         # obs_state_t: [batch, state_dim] -> unsqueeze to [batch, 1, state_dim]
+        # Use current observation (same reference used for relative actions in training)
         absolute_actions = relative_actions + obs_state_t.unsqueeze(1)
 
     inference_time_ms = (time.perf_counter() - start_time) * 1000
