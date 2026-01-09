@@ -31,12 +31,13 @@ Usage:
         --fps=30 \
         --episode_time_s=60 \
         --execution_latency_ms=100 \
-        --display_data=true
+        --display_data=true \
+        --debug_timing=true
 """
 
 import logging
 import math
-import signal
+import sys
 import time
 import traceback
 from collections import deque
@@ -55,15 +56,12 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
+from lerobot.rl.process import ProcessSignalHandler
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
     so100_follower,
     so101_follower,
-)
-from lerobot.utils.control_utils import (
-    init_keyboard_listener,
-    is_headless,
 )
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say
@@ -99,9 +97,16 @@ class EvalAsyncDiscardConfig:
     # Measured empirically (~100ms with std ~10ms for SO101)
     execution_latency_ms: float = 100.0
 
+    # Queue threshold: run inference when queue size drops to this value
+    # Should be higher than inference delay + execution horizon
+    action_queue_size_to_get_new_actions: int = 2
+
     # Display and feedback
     display_data: bool = False
     play_sounds: bool = True
+
+    # Debug options
+    debug_timing: bool = False
 
     def __post_init__(self):
         # Parse policy path from CLI if provided
@@ -158,7 +163,7 @@ class RobotWrapper:
 # ============================================================================
 
 
-class AsyncActionQueue:
+class ActionQueue:
     """Thread-safe action queue for async inference with action discarding.
 
     This queue manages action chunks from the inference thread to the actor thread.
@@ -169,24 +174,28 @@ class AsyncActionQueue:
         queue: Current action chunk tensor [remaining_actions, action_dim]
         action_idx: Index of next action to execute
         chunk_start_time: Time when the current chunk was inserted
+        chunk_idx: Inference counter for the current chunk
     """
 
     def __init__(self):
         self.queue: torch.Tensor | None = None
         self.action_idx: int = 0
         self.chunk_start_time: float = 0.0
+        self.chunk_idx: int = 0
         self.lock = Lock()
 
     def replace(
         self,
         action_chunk: torch.Tensor,
         n_skip: int,
+        chunk_idx: int,
     ) -> int:
         """Replace queue with new action chunk, skipping first n_skip actions.
 
         Args:
             action_chunk: New action chunk [batch, n_actions, action_dim]
             n_skip: Number of actions to skip at the start
+            chunk_idx: Inference counter for this chunk
 
         Returns:
             Number of actions actually discarded (includes leftover from prev chunk)
@@ -207,22 +216,28 @@ class AsyncActionQueue:
             self.queue = actions[n_skip:]
             self.action_idx = 0
             self.chunk_start_time = time.perf_counter()
+            self.chunk_idx = chunk_idx
 
             return leftover + n_skip
 
-    def get(self) -> torch.Tensor | None:
+    def get(self) -> tuple[torch.Tensor, int, int] | None:
         """Get the next action from the queue.
 
         Returns:
-            Action tensor [action_dim] or None if queue is empty.
+            Tuple of (action_tensor, chunk_idx, action_idx) or None if queue is empty.
+            - action_tensor: Action tensor [action_dim]
+            - chunk_idx: Which inference generated this action
+            - action_idx: Position within that inference's action sequence (0-indexed)
         """
         with self.lock:
             if self.queue is None or self.action_idx >= len(self.queue):
                 return None
 
             action = self.queue[self.action_idx].clone()
+            action_idx = self.action_idx
+            chunk_idx = self.chunk_idx
             self.action_idx += 1
-            return action
+            return action, chunk_idx, action_idx
 
     def qsize(self) -> int:
         """Get number of remaining actions in the queue."""
@@ -299,139 +314,6 @@ class ObservationQueue:
 # ============================================================================
 
 
-def warmup_policy(
-    robot: RobotWrapper,
-    policy: PreTrainedPolicy,
-    preprocessor: PolicyProcessorPipeline,
-    obs_queue: ObservationQueue,
-    device: torch.device,
-    n_action_steps: int,
-    motor_names: list[str],
-    camera_names: list[str],
-    use_amp: bool,
-) -> None:
-    """Warm up the policy with a dummy inference to avoid slow first inference during episode.
-
-    This pre-initializes CUDA kernels, model weights, and other first-run overhead.
-    """
-    logging.info("Warming up policy...")
-    raw_obs = robot.get_observation()
-
-    # Build observation frame
-    observation_frame = {}
-    state_values = [raw_obs[motor_name] for motor_name in motor_names]
-    observation_frame["observation.state"] = np.array(state_values, dtype=np.float32)
-    for cam_name in camera_names:
-        observation_frame[f"observation.images.{cam_name}"] = raw_obs[cam_name]
-
-    # Run a dummy inference
-    start_time = time.perf_counter()
-    _, _ = run_inference_chunk(
-        observation_frame=observation_frame,
-        obs_queue=obs_queue,
-        policy=policy,
-        device=device,
-        preprocessor=preprocessor,
-        n_action_steps=n_action_steps,
-        use_amp=use_amp,
-        task=None,
-        robot_type=robot.robot_type,
-    )
-    warmup_time_ms = (time.perf_counter() - start_time) * 1000
-    logging.info(f"Policy warmup complete ({warmup_time_ms:.1f}ms)")
-
-
-def run_inference_chunk(
-    observation_frame: dict[str, np.ndarray],
-    obs_queue: ObservationQueue,
-    policy: PreTrainedPolicy,
-    device: torch.device,
-    preprocessor: PolicyProcessorPipeline,
-    n_action_steps: int,
-    use_amp: bool,
-    task: str | None = None,
-    robot_type: str | None = None,
-) -> tuple[torch.Tensor, float]:
-    """Run policy inference and return absolute action chunk with timing.
-
-    This function handles the full inference pipeline:
-    1. Prepare observation for inference (convert to tensors, add batch dim)
-    2. Apply preprocessor (image normalization, device placement)
-    3. Update observation queue and compute delta
-    4. Normalize delta observation (if policy has relative stats)
-    5. Call policy.predict_action_chunk() to get normalized relative actions
-    6. Unnormalize relative actions (if policy has relative stats)
-    7. Convert relative to absolute: absolute = relative + obs[t]
-
-    Args:
-        observation_frame: Raw observation dict with numpy arrays
-        obs_queue: ObservationQueue for delta computation
-        policy: The ACTRelativeRTCPolicy
-        device: Torch device for inference
-        preprocessor: Pipeline for observation preprocessing
-        n_action_steps: Number of actions to return from the chunk
-        use_amp: Whether to use automatic mixed precision
-        task: Optional task identifier
-        robot_type: Optional robot type identifier
-
-    Returns:
-        Tuple of (absolute_action_chunk, inference_time_ms) where:
-        - absolute_action_chunk: [batch, n_action_steps, action_dim] tensor
-        - inference_time_ms: Time taken for inference in milliseconds
-    """
-    start_time = time.perf_counter()
-
-    with (
-        torch.inference_mode(),
-        torch.autocast(device_type=device.type)
-        if device.type == "cuda" and use_amp
-        else nullcontext(),
-    ):
-        # Step 1 & 2: Convert to tensors and apply preprocessor
-        observation = prepare_observation_for_inference(
-            observation_frame, device, task, robot_type
-        )
-        observation = preprocessor(observation)
-
-        # Step 3: Update observation queue and compute delta
-        obs_state = observation["observation.state"]  # [batch, state_dim]
-        obs_queue.update(obs_state)
-        delta_obs, obs_state_t = obs_queue.get_delta()
-
-        # Step 4: Normalize delta observation if stats are available
-        if policy.has_relative_stats:
-            delta_obs_normalized = policy.delta_obs_normalizer(delta_obs)
-        else:
-            delta_obs_normalized = delta_obs
-
-        # Create inference batch with delta observation
-        inference_batch = dict(observation)
-        inference_batch["observation.state"] = delta_obs_normalized
-
-        # Step 5: Get normalized relative action chunk from policy
-        relative_actions_normalized = policy.predict_action_chunk(inference_batch)
-        # Shape: [batch, chunk_size, action_dim]
-
-        # Slice to n_action_steps
-        relative_actions_normalized = relative_actions_normalized[:, :n_action_steps, :]
-
-        # Step 6: Unnormalize relative actions
-        if policy.has_relative_stats:
-            relative_actions = policy.relative_action_normalizer.inverse(
-                relative_actions_normalized
-            )
-        else:
-            relative_actions = relative_actions_normalized
-
-        # Step 7: Convert to absolute actions
-        # relative_actions: [batch, n_action_steps, action_dim]
-        # obs_state_t: [batch, state_dim] -> unsqueeze to [batch, 1, state_dim]
-        absolute_actions = relative_actions + obs_state_t.unsqueeze(1)
-
-    inference_time_ms = (time.perf_counter() - start_time) * 1000
-    return absolute_actions, inference_time_ms
-
-
 def compute_actions_to_skip(
     inference_ms: float,
     execution_latency_ms: float,
@@ -467,7 +349,7 @@ def inference_thread_fn(
     policy: PreTrainedPolicy,
     preprocessor: PolicyProcessorPipeline,
     obs_queue: ObservationQueue,
-    action_queue: AsyncActionQueue,
+    action_queue: ActionQueue,
     device: torch.device,
     cfg: EvalAsyncDiscardConfig,
     n_action_steps: int,
@@ -480,19 +362,26 @@ def inference_thread_fn(
     """Inference thread: continuously runs policy inference and updates action queue.
 
     This thread:
-    1. Gets observation from robot
-    2. Runs policy inference
-    3. Computes how many actions to skip
-    4. Replaces the action queue with new chunk (discarding stale actions)
-    5. Repeats continuously until shutdown
+    1. Waits until queue size drops below threshold
+    2. Gets observation from robot
+    3. Runs policy inference (reads from observation queue, doesn't update it)
+    4. Computes how many actions to skip
+    5. Replaces the action queue with new chunk (discarding stale actions)
+    6. Repeats until shutdown
 
     The actor thread continues executing from the queue while this thread computes.
+    The observation queue is only updated by the actor thread.
     """
-    chunk_idx = 0
-    last_log_time = time.perf_counter()
+    use_amp = policy.config.use_amp
+    chunk_idx = 0  # Counter for number of inferences performed
 
     try:
         while not shutdown_event.is_set():
+            # Wait until queue size drops below threshold
+            if action_queue.qsize() > cfg.action_queue_size_to_get_new_actions:
+                time.sleep(0.01)  # Small sleep to prevent busy waiting
+                continue
+
             # Get observation
             raw_obs = robot.get_observation()
 
@@ -509,22 +398,68 @@ def inference_thread_fn(
             for cam_name in camera_names:
                 observation_frame[f"observation.images.{cam_name}"] = raw_obs[cam_name]
 
-            # Run inference
-            action_chunk, inference_ms = run_inference_chunk(
-                observation_frame=observation_frame,
-                obs_queue=obs_queue,
-                policy=policy,
-                device=device,
-                preprocessor=preprocessor,
-                n_action_steps=n_action_steps,
-                use_amp=policy.config.use_amp,
-                task=None,
-                robot_type=robot.robot_type,
-            )
+            # Run inference (inline)
+            inference_start_time = time.perf_counter()
+
+            with (
+                torch.inference_mode(),
+                torch.autocast(device_type=device.type)
+                if device.type == "cuda" and use_amp
+                else nullcontext(),
+            ):
+                # Step 1 & 2: Convert to tensors and apply preprocessor
+                observation = prepare_observation_for_inference(
+                    observation_frame, device, None, robot.robot_type
+                )
+                observation = preprocessor(observation)
+
+                # Step 3: Compute delta from observation queue (read-only, don't update)
+                # The queue is updated by the actor thread at every fps tick
+                # Observations are already on GPU (moved there by actor thread)
+                delta_obs, obs_state_t = obs_queue.get_delta()
+
+                # Step 4: Normalize delta observation if stats are available
+                if policy.has_relative_stats:
+                    delta_obs_normalized = policy.delta_obs_normalizer(delta_obs)
+                else:
+                    delta_obs_normalized = delta_obs
+
+                # Create inference batch with delta observation
+                inference_batch = dict(observation)
+                inference_batch["observation.state"] = delta_obs_normalized
+
+                # Step 5: Get normalized relative action chunk from policy
+                relative_actions_normalized = policy.predict_action_chunk(
+                    inference_batch
+                )
+                # Shape: [batch, chunk_size, action_dim]
+
+                # Slice to n_action_steps
+                relative_actions_normalized = relative_actions_normalized[
+                    :, :n_action_steps, :
+                ]
+
+                # Step 6: Unnormalize relative actions
+                if policy.has_relative_stats:
+                    relative_actions = policy.relative_action_normalizer.inverse(
+                        relative_actions_normalized
+                    )
+                else:
+                    relative_actions = relative_actions_normalized
+
+                # Step 7: Convert to absolute actions
+                # relative_actions: [batch, n_action_steps, action_dim]
+                # obs_state_t: [batch, state_dim] -> unsqueeze to [batch, 1, state_dim]
+                absolute_actions = relative_actions + obs_state_t.unsqueeze(1)
+
+            inference_ms = (time.perf_counter() - inference_start_time) * 1000
 
             # Check shutdown after inference
             if shutdown_event.is_set():
                 break
+
+            # Increment inference idx
+            chunk_idx += 1
 
             # Record latency
             latency_tracker.record(inference_ms, log_to_rerun=cfg.display_data)
@@ -536,33 +471,27 @@ def inference_thread_fn(
                 fps=cfg.fps,
             )
 
-            # Move to CPU before putting in queue
-            action_chunk_cpu = action_chunk.cpu()
-
             # Replace queue with new chunk (discarding stale actions)
-            total_discarded = action_queue.replace(action_chunk_cpu, n_skip)
+            # Note: Actions stay on GPU/device until actor thread moves them to CPU
+            total_discarded = action_queue.replace(absolute_actions, n_skip, chunk_idx)
 
             # Record discarded count
             discard_tracker.record(total_discarded, log_to_rerun=cfg.display_data)
 
-            # Log periodically (every 2 seconds or every 50 chunks, whichever comes first)
-            queue_size = action_queue.qsize()
-            now = time.perf_counter()
-            if chunk_idx == 0 or (now - last_log_time) >= 2.0 or chunk_idx % 50 == 0:
+            # Log inference completion (only in debug mode)
+            if cfg.debug_timing:
                 logging.info(
-                    f"[INFERENCE] Chunk {chunk_idx}: inference={inference_ms:.1f}ms, "
-                    f"skip={n_skip}, discarded={total_discarded}, queue_size={queue_size}"
+                    f"[INFERENCE] #{chunk_idx} | "
+                    f"latency={inference_ms:.1f}ms | "
+                    f"actions_to_skip={n_skip} | "
+                    f"actions_discarded={total_discarded}"
                 )
-                last_log_time = now
-
-            chunk_idx += 1
 
     except Exception as e:
         logging.error(f"[INFERENCE] Fatal exception: {e}")
         traceback.print_exc()
         shutdown_event.set()
-
-    logging.info(f"[INFERENCE] Thread shutting down. Total chunks: {chunk_idx}")
+        sys.exit(1)
 
 
 # ============================================================================
@@ -572,9 +501,12 @@ def inference_thread_fn(
 
 def actor_thread_fn(
     robot: RobotWrapper,
-    action_queue: AsyncActionQueue,
+    action_queue: ActionQueue,
+    obs_queue: ObservationQueue,
     ds_features,
     cfg: EvalAsyncDiscardConfig,
+    device: torch.device,
+    motor_names: list[str],
     shutdown_event: Event,
     total_actions_counter: list,  # Use list for mutable reference
 ) -> None:
@@ -582,23 +514,32 @@ def actor_thread_fn(
 
     This thread:
     1. Gets next action from queue (or waits if empty)
-    2. Sends action to robot
-    3. Sleeps to maintain target fps
-    4. Repeats until shutdown
+    2. Sends action to robot (if available)
+    3. Updates observation queue at every fps tick (independent of actions)
+    4. Sleeps to maintain target fps
+    5. Repeats until shutdown
+
+    Observations are independent from actions - the queue is updated every iteration
+    to track the continuous state of the robot.
     """
     dt_target = 1.0 / cfg.fps
     action_count = 0
-    empty_queue_count = 0
-    last_empty_log_time = 0.0
+    timestep = 0  # Track timestep counter for logging
 
     try:
         while not shutdown_event.is_set():
             action_start_t = time.perf_counter()
+            timestamp = time.time()  # Wall clock timestamp
 
-            # Get action from queue
-            action_tensor = action_queue.get()
+            # Get action from queue (returns tuple with metadata)
+            action_result = action_queue.get()
 
-            if action_tensor is not None:
+            if action_result is not None:
+                action_tensor, chunk_idx, action_idx = action_result
+
+                # Move action to CPU (matching lerobot_async_inference_example.py pattern)
+                action_tensor = action_tensor.cpu()
+
                 # Convert action tensor to robot action dict
                 # make_robot_action uses ds_features[ACTION]["names"] to build keys
                 # If dataset action names include '.pos' suffix, robot_action is ready to use
@@ -615,35 +556,39 @@ def actor_thread_fn(
                 robot.send_action(robot_action)
                 action_count += 1
                 total_actions_counter[0] = action_count
-                empty_queue_count = 0  # Reset counter when we have actions
-            else:
-                # Queue is empty - track this for debugging
-                empty_queue_count += 1
-                now = time.perf_counter()
-                # Log if queue has been empty for more than 0.5 seconds
-                if empty_queue_count == 1 or (now - last_empty_log_time) >= 0.5:
-                    queue_size = action_queue.qsize()
-                    logging.debug(
-                        f"[ACTOR] Queue empty (size={queue_size}, "
-                        f"empty_count={empty_queue_count})"
+
+                # Log action execution (only if debug_timing is enabled)
+                if cfg.debug_timing:
+                    logging.info(
+                        f"[ACTOR] timestep={timestep} | "
+                        f"timestamp={timestamp:.3f} | "
+                        f"chunk_idx={chunk_idx} | "
+                        f"action_idx={action_idx} | "
+                        f"action_count={action_count}"
                     )
-                    last_empty_log_time = now
+                    timestep += 1
+
+            # Update observation queue at every fps tick (independent of actions)
+            # Ensures the queue advances continuously, matching select_action behavior
+            # In lerobot-record, select_action is called every step and updates the queue each time.
+            # Here we need to manually update the queue every iteration to maintain the same behavior.
+            # Move observations to GPU immediately (inference thread will use them directly)
+            raw_obs = robot.get_observation()
+            state_values = [raw_obs[motor_name] for motor_name in motor_names]
+            obs_state = torch.tensor(
+                np.array(state_values, dtype=np.float32), device=device
+            ).unsqueeze(0)  # Add batch dimension [1, state_dim]
+            obs_queue.update(obs_state)
 
             # Sleep to maintain target fps
-            # Use shorter sleep intervals to respond faster to shutdown
             action_duration = time.perf_counter() - action_start_t
-            remaining_sleep = dt_target - action_duration
-
-            # Sleep in small increments to check shutdown more frequently
-            while remaining_sleep > 0 and not shutdown_event.is_set():
-                sleep_chunk = min(remaining_sleep, 0.01)  # 10ms max
-                precise_sleep(sleep_chunk)
-                remaining_sleep -= sleep_chunk
+            precise_sleep(max(0, (dt_target - action_duration) - 0.001))
 
     except Exception as e:
         logging.error(f"[ACTOR] Fatal exception: {e}")
         traceback.print_exc()
         shutdown_event.set()
+        sys.exit(1)
 
     logging.info(
         f"[ACTOR] Thread shutting down. Total actions executed: {action_count}"
@@ -660,12 +605,12 @@ def run_episode_async_discard(
     policy: PreTrainedPolicy,
     preprocessor: PolicyProcessorPipeline,
     postprocessor: PolicyProcessorPipeline,
-    events: dict,
     cfg: EvalAsyncDiscardConfig,
     device: torch.device,
     latency_tracker: LatencyTracker,
     discard_tracker: DiscardTracker,
     ds_meta,
+    shutdown_event: Event,
 ) -> None:
     """Run a single episode with asynchronous inference and action discarding.
 
@@ -693,7 +638,7 @@ def run_episode_async_discard(
     obs_queue = ObservationQueue(obs_state_delta_frames)
 
     # Create action queue for thread communication
-    action_queue = AsyncActionQueue()
+    action_queue = ActionQueue()
 
     # Setup rerun styling (static, logged once)
     if cfg.display_data:
@@ -732,21 +677,14 @@ def run_episode_async_discard(
     # Wrap robot for thread-safe access
     robot_wrapper = RobotWrapper(robot)
 
-    # Warm up policy before starting episode to avoid slow first inference
-    warmup_policy(
-        robot=robot_wrapper,
-        policy=policy,
-        preprocessor=preprocessor,
-        obs_queue=obs_queue,
-        device=device,
-        n_action_steps=n_action_steps,
-        motor_names=motor_names,
-        camera_names=camera_names,
-        use_amp=policy.config.use_amp,
-    )
-
-    # Create shutdown event for threads
-    shutdown_event = Event()
+    # Initialize observation queue with current observation
+    # Store on GPU (actor thread will update with GPU tensors)
+    raw_obs_init = robot.get_observation()
+    state_values_init = [raw_obs_init[motor_name] for motor_name in motor_names]
+    obs_state_init = torch.tensor(
+        np.array(state_values_init, dtype=np.float32), device=device
+    ).unsqueeze(0)
+    obs_queue.update(obs_state_init)
 
     # Counter for total actions (mutable reference for actor thread)
     total_actions_counter = [0]
@@ -785,8 +723,11 @@ def run_episode_async_discard(
             args=(
                 robot_wrapper,
                 action_queue,
+                obs_queue,
                 ds_features,
                 cfg,
+                device,
+                motor_names,
                 shutdown_event,
                 total_actions_counter,
             ),
@@ -802,31 +743,22 @@ def run_episode_async_discard(
             elapsed = time.perf_counter() - start_episode_t
 
             # Check termination conditions
-            if events.get("exit_early") or events.get("stop_recording"):
-                events["exit_early"] = False
-                break
-
             if elapsed >= cfg.episode_time_s:
                 break
 
             # Sleep briefly to avoid busy waiting
-            # Use short interval to respond quickly to events
-            time.sleep(0.05)
+            time.sleep(0.1)
 
     finally:
         # Signal threads to shutdown
         shutdown_event.set()
 
-        # Wait for threads to finish with timeout
+        # Wait for threads to finish
         if inference_thread is not None and inference_thread.is_alive():
-            inference_thread.join(timeout=3.0)
-            if inference_thread.is_alive():
-                logging.warning("Inference thread did not exit cleanly")
+            inference_thread.join()
 
         if actor_thread is not None and actor_thread.is_alive():
-            actor_thread.join(timeout=3.0)
-            if actor_thread.is_alive():
-                logging.warning("Actor thread did not exit cleanly")
+            actor_thread.join()
 
     # Log final stats
     total_time = time.perf_counter() - start_episode_t
@@ -875,7 +807,8 @@ def main(cfg: EvalAsyncDiscardConfig) -> None:
         init_rerun(session_name="eval_async_discard")
 
     # Setup device
-    device = get_safe_torch_device(cfg.policy.device)
+    device_str = cfg.policy.device if cfg.policy.device else "auto"
+    device = get_safe_torch_device(device_str)
     logging.info(f"Using device: {device}")
 
     # Create robot
@@ -892,36 +825,25 @@ def main(cfg: EvalAsyncDiscardConfig) -> None:
     logging.info(f"Loading policy from {cfg.policy.pretrained_path}...")
     policy = make_policy(cfg.policy, ds_meta=ds_meta, env_cfg=None)
 
+    # Override device processor to use the detected device (cuda/cpu/mps)
+    # This ensures compatibility when loading models trained on different hardware
+    preprocessor_overrides = {
+        "device_processor": {"device": str(policy.config.device)},
+    }
+
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
+        preprocessor_overrides=preprocessor_overrides,
     )
-
-    # Initialize keyboard listener
-    listener, events = init_keyboard_listener()
 
     # Create trackers
     latency_tracker = LatencyTracker()
     discard_tracker = DiscardTracker()
 
-    # Setup signal handler for graceful shutdown on Ctrl+C
-    shutdown_requested = [False]
-    original_sigint = signal.getsignal(signal.SIGINT)
-
-    def sigint_handler(signum, frame):
-        if shutdown_requested[0]:
-            # Second Ctrl+C - force exit
-            logging.warning("Force exit requested")
-            if original_sigint and callable(original_sigint):
-                original_sigint(signum, frame)
-            else:
-                raise KeyboardInterrupt
-        else:
-            shutdown_requested[0] = True
-            events["exit_early"] = True
-            logging.info("Shutdown requested (press Ctrl+C again to force)")
-
-    signal.signal(signal.SIGINT, sigint_handler)
+    # Setup signal handler for graceful shutdown
+    signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
+    shutdown_event = signal_handler.shutdown_event
 
     try:
         # Connect robot
@@ -930,21 +852,18 @@ def main(cfg: EvalAsyncDiscardConfig) -> None:
         log_say("Robot connected", cfg.play_sounds)
 
         # Run episode
-        log_say(
-            "Starting evaluation",
-            cfg.play_sounds,
-        )
+        log_say("Starting evaluation", cfg.play_sounds)
         run_episode_async_discard(
             robot=robot,
             policy=policy,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
-            events=events,
             cfg=cfg,
             device=device,
             latency_tracker=latency_tracker,
             discard_tracker=discard_tracker,
             ds_meta=ds_meta,
+            shutdown_event=shutdown_event,
         )
 
         log_say("Episode finished", cfg.play_sounds, blocking=True)
@@ -953,16 +872,10 @@ def main(cfg: EvalAsyncDiscardConfig) -> None:
         logging.info("Interrupted by user")
 
     finally:
-        # Restore original signal handler
-        signal.signal(signal.SIGINT, original_sigint)
-
         # Cleanup
-        if robot.is_connected:
+        if robot and robot.is_connected:
             logging.info("Disconnecting robot...")
             robot.disconnect()
-
-        if not is_headless() and listener:
-            listener.stop()
 
         log_say("Done", cfg.play_sounds, blocking=True)
 
