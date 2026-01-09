@@ -75,7 +75,8 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
 
         Args:
             observation: The observation dictionary containing image tensors.
-                         Images can have shape (C, H, W), (T, C, H, W), (B, T, C, H, W), etc.
+                         Images are expected to have shape (1, C, H, W), (T, C, H, W),
+                         or (B, T, C, H, W) after AddBatchDimensionProcessorStep.
 
         Returns:
             A new observation dictionary with transformed images.
@@ -92,9 +93,17 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
 
             image = observation[key]
 
-            # Ensure image is float32 tensor (interpolate requires float)
+            # Skip non-tensor values or tensors that don't look like images
             if not isinstance(image, torch.Tensor):
-                image = torch.tensor(image)
+                continue
+
+            original_ndim = len(image.shape)
+            # Only process tensors with 4 or 5 dimensions (actual images)
+            # Skip 2D/3D tensors that might have "image" in their key name
+            if original_ndim not in (4, 5):
+                continue
+
+            # Ensure image is float32 tensor (interpolate requires float)
             if image.dtype != torch.float32:
                 if image.dtype == torch.uint8:
                     image = image.float() / 255.0
@@ -102,34 +111,22 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
                     image = image.float()
 
             device = image.device
-            original_shape = image.shape
-            original_ndim = len(original_shape)
 
             # Normalize to (N, C, H, W) format for processing
-            # Store shape info for restoration
-            shape_info = None
-            if original_ndim == 2:
-                # (H, W) -> (1, 1, H, W)
-                image = image.unsqueeze(0).unsqueeze(0)
-                shape_info = ("2d",)
-            elif original_ndim == 3:
-                # (C, H, W) -> (1, C, H, W)
-                image = image.unsqueeze(0)
-                shape_info = ("3d",)
-            elif original_ndim == 4:
-                # (T, C, H, W) or (N, C, H, W) -> already correct
-                shape_info = ("4d",)
+            # After AddBatchDimensionProcessorStep, we only see 4D or 5D shapes
+            restore_5d = False
+            if original_ndim == 4:
+                # (1, C, H, W) or (T, C, H, W) -> already in (N, C, H, W) format
+                # No reshaping needed
+                pass
             elif original_ndim == 5:
                 # (B, T, C, H, W) -> flatten to (B*T, C, H, W)
                 B, T, C, H, W = image.shape
                 image = image.view(B * T, C, H, W)
-                shape_info = ("5d", B, T)
-            else:
-                raise ValueError(
-                    f"Unexpected image shape: {image.shape} (expected 2-5 dimensions)"
-                )
+                restore_5d = True
+                original_B, original_T = B, T
 
-            # Now image is (N, C, H, W)
+            # Now image is (N, C, H, W) where N >= 1
             N, C, H, W = image.shape
 
             # Pad to square
@@ -154,16 +151,12 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
                     mode="area",
                 )
 
-            # Restore original shape
-            if shape_info[0] == "2d":
-                image = image.squeeze(0).squeeze(0)
-            elif shape_info[0] == "3d":
-                image = image.squeeze(0)
-            elif shape_info[0] == "4d":
-                pass  # Already correct shape
-            elif shape_info[0] == "5d":
-                _, B, T = shape_info
-                image = image.view(B, T, C, image.shape[-2], image.shape[-1])
+            # Restore original shape if needed (only for 5D case)
+            if restore_5d:
+                # Restore (B, T, C, H, W) from (B*T, C, H, W)
+                image = image.view(
+                    original_B, original_T, C, image.shape[-2], image.shape[-1]
+                )
 
             # Move back to original device
             if is_mps:
@@ -238,11 +231,11 @@ def make_act_relative_rtc_pre_post_processors(
 
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
+        AddBatchDimensionProcessorStep(),
+        DeviceProcessorStep(device=config.device),
         ImagePadSquareResizeProcessorStep(
             downscale_img_square=config.downscale_img_square
         ),
-        AddBatchDimensionProcessorStep(),
-        DeviceProcessorStep(device=config.device),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
