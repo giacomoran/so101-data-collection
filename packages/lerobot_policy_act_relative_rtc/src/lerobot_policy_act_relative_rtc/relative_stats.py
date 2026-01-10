@@ -47,7 +47,10 @@ def compute_relative_stats(
                  - index 1 = obs[t]
                  and action with shape [chunk_size, action_dim].
         batch_size: Batch size for iterating through the dataset.
-        num_workers: Number of workers for the DataLoader.
+        num_workers: Number of workers for the DataLoader. Defaults to 4.
+                    This can be configured via policy config's
+                    relative_stats_num_workers parameter to respect
+                    --num_workers argument from lerobot-train.
 
     Returns:
         Dictionary with statistics for delta_obs and relative_action:

@@ -209,10 +209,12 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         )
 
         # Compute relative stats
+        # Use num_workers from config if set, otherwise default to 4
+        num_workers = self.config.relative_stats_num_workers or 4
         stats = compute_relative_stats(
             dataset,
             batch_size=64,
-            num_workers=4,
+            num_workers=num_workers,
         )
 
         # Configure normalizers

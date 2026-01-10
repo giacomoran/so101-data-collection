@@ -79,6 +79,10 @@ class ACTRelativeRTCConfig(PreTrainedConfig):
     # Note: Stats will still be loaded from checkpoints if available
     skip_compute_relative_stats: bool = False
 
+    # Number of workers for computing relative stats during initialization.
+    # If None, defaults to 4. This allows respecting the --num_workers argument from lerobot-train.
+    relative_stats_num_workers: int | None = None
+
     # Image preprocessing
     # If specified, images are first padded to square with black borders, then downscaled
     # to the target resolution using area interpolation. For example, setting to 224 will
