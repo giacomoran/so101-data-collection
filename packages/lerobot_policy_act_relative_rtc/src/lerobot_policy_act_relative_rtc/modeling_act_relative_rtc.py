@@ -121,9 +121,9 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         Args:
             config: Policy configuration.
             dataset_meta: Optional LeRobotDatasetMetadata. If provided and relative stats
-                are not already configured (e.g., from a checkpoint), the dataset will be
-                recreated and relative stats will be computed. This happens automatically
-                when using lerobot-train.
+            are not already configured (e.g., from a checkpoint), the dataset will be
+            recreated and relative stats will be computed. This happens automatically
+            when using lerobot-train.
             **kwargs: Additional arguments (ignored).
         """
         super().__init__(config)
@@ -209,12 +209,10 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         )
 
         # Compute relative stats
-        # Use num_workers from config if set, otherwise default to 4
-        num_workers = self.config.relative_stats_num_workers or 4
         stats = compute_relative_stats(
             dataset,
             batch_size=64,
-            num_workers=num_workers,
+            num_workers=self.config.num_workers,
         )
 
         # Configure normalizers

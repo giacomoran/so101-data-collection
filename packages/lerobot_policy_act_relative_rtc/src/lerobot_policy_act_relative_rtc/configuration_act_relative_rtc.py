@@ -80,8 +80,9 @@ class ACTRelativeRTCConfig(PreTrainedConfig):
     skip_compute_relative_stats: bool = False
 
     # Number of workers for computing relative stats during initialization.
-    # If None, defaults to 4. This allows respecting the --num_workers argument from lerobot-train.
-    relative_stats_num_workers: int | None = None
+    # Defaults to 4. Set via `--policy.num_workers` CLI argument.
+    # Tip: Set this to match `--num_workers` for consistency with main training dataloader.
+    num_workers: int = 4
 
     # Image preprocessing
     # If specified, images are first padded to square with black borders, then downscaled
