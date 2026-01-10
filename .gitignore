@@ -51,6 +51,7 @@ result-*
 *.swo
 *~
 .DS_Store
+.ruff_cache/
 
 # Jupyter Notebook
 .ipynb_checkpoints

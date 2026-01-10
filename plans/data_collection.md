@@ -1,27 +1,3 @@
----
-name: Data Collection Script
-overview: Create a benchmark-aware data collection script that wraps LeRobot's recording functionality, adds support for hand-guided demonstrations, tracks benchmark metrics, and buffers episodes in memory to prevent corruption.
-todos:
-  - id: collect-script
-    content: Create src/collect.py with CLI args for task, method, warmup, num-episodes
-    status: completed
-  - id: hand-guided
-    content: "Implement hand-guided mode: single arm provides both obs and action"
-    status: completed
-  - id: memory-buffer
-    content: Implement memory buffering with flush every N episodes
-    status: completed
-  - id: benchmark-tracker
-    content: Create benchmark_tracker.py for CSV metrics logging
-    status: completed
-  - id: cursor-rules
-    content: Add LeRobot v3 docs references to cursor rules
-    status: completed
-  - id: dry-run
-    content: Test with pick_place_cube + hand_guided + wrist camera only
-    status: completed
----
-
 # Data Collection Script for SO-101 Benchmark
 
 ## Architecture
@@ -31,31 +7,29 @@ flowchart TB
     subgraph CLI [CLI Entry Point]
         Args[--task, --method, --warmup, --num-episodes, etc.]
     end
-    
+
     subgraph Core [Recording Core]
         Robot[SO101Follower + Cameras]
         Teleop[SO101Leader or HandGuided]
         Loop[Recording Loop]
     end
-    
+
     subgraph Buffer [Memory Buffer]
         EpisodeBuffer[Episode Frames in RAM]
         FlushTrigger[Flush every 10 episodes]
     end
-    
+
     subgraph Output [Output]
         Dataset[LeRobotDataset on disk]
         CSV[benchmark_metrics.csv]
         Plan[plan.md updates]
     end
-    
+
     CLI --> Core
     Core --> Buffer
     Buffer --> Dataset
     Loop --> CSV
 ```
-
-
 
 ## Key Files
 
@@ -114,5 +88,3 @@ Leverage existing LeRobot code:
 - `OpenCVCamera` for cameras
 - `VideoEncodingManager` for video encoding
 - `init_keyboard_listener()` for keyboard controls (exit early, re-record)
-
-### 6. Documentation Updates
