@@ -11,6 +11,7 @@ dependencies = [
   "scipy>=1.15.3",
   # Reference the policy package from the workspace
   "lerobot_policy_act_relative_rtc",
+  "datafusion>=51.0.0",
 ]
 
 [tool.uv.sources]

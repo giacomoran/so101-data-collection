@@ -5,7 +5,7 @@ discarding metrics during policy evaluation. Inspired by LeRobot's RTC
 latency tracking implementation.
 """
 
-from threading import Lock
+from threading import RLock
 
 import numpy as np
 import rerun as rr
@@ -17,7 +17,7 @@ class LatencyTracker:
     def __init__(self):
         self.latencies_ms: list[float] = []
         self.chunk_idx: int = 0
-        self.lock = Lock()
+        self.lock = RLock()
 
     def record(self, latency_ms: float, log_to_rerun: bool = True) -> None:
         """Record a single inference latency measurement."""
@@ -85,7 +85,7 @@ class DiscardTracker:
     def __init__(self):
         self.discarded_counts: list[int] = []
         self.chunk_idx: int = 0
-        self.lock = Lock()
+        self.lock = RLock()
 
     def record(self, n_discarded: int, log_to_rerun: bool = True) -> None:
         """Record number of discarded actions for a chunk."""
