@@ -70,9 +70,16 @@ class ACTRelativeRTCConfig(PreTrainedConfig):
     # Higher values give larger, more meaningful deltas when data is high-frequency.
     obs_state_delta_frames: int = 1
 
-    # Real-Time Chunking (RTC) - reserved for future implementation
-    # When enabled, will apply training-time smoothing to reduce discontinuities at chunk boundaries
+    # Real-Time Chunking (RTC) - training-time action prefix conditioning
+    # When enabled, the model is trained with random action prefixes to simulate
+    # inference-time delays, improving chunk boundary consistency.
+    # - Training: Sample per-sample delay from {1, ..., rtc_max_delay}, condition
+    #   policy on action prefix using encoder_input strategy, mask loss for postfix only
+    # - Inference: predict_action_chunk accepts delay and action_prefix from previous chunk
     use_rtc: bool = False
+
+    # Maximum delay for RTC training (samples uniformly from [1, rtc_max_delay])
+    rtc_max_delay: int = 3
 
     # Debug flag to skip relative stats computation during training initialization
     # When True, skips the 2-minute relative stats computation step (useful for debugging)

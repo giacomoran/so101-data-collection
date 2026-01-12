@@ -25,9 +25,47 @@ These modifications follow the approach described in the UMI paper for handling 
 - **Standard ACT**: Normalizes absolute observations and actions using dataset statistics
 - **ACT Relative RTC**: Disables standard normalization for STATE and ACTION (set to IDENTITY), instead computing and applying normalization on the relative values (delta_obs, relative_action) internally
 
+## Real-Time Chunking (RTC)
+
+When `use_rtc=True`, the policy implements "training-time RTC" to improve chunk boundary consistency:
+
+### Training (use_rtc=True)
+- Per-sample delay is sampled uniformly from {0, ..., rtc_max_delay}
+- Action prefix (first `delay` actions) is extracted from the chunk
+- Prefix is padded to `rtc_max_delay` using learnable `pad_embed` parameter
+- Prefix tokens are concatenated to encoder input (after latent, state, images)
+- Prefix tokens participate in encoder self-attention (encoder_input strategy)
+- Loss is computed only on postfix (positions >= delay per sample)
+  - Note: With delay=0, loss is computed on all positions (no masking)
+
+### Inference (use_rtc=True)
+- `select_action()` is NOT supported; use `predict_action_chunk()` instead
+- `predict_action_chunk()` accepts `delay` and `action_prefix` parameters
+- `action_prefix` contains absolute actions from previous chunk
+- Method converts to relative, normalizes, and passes to model
+- Model uses prefix to condition prediction for smooth chunk transitions
+
+### How It Works
+1. During training, model learns to handle variable-length prefixes via per-sample delays
+2. Learnable `pad_embed` (parameter) allows model to distinguish real prefix from padding
+3. At inference, fixed delay from previous chunk provides consistent conditioning
+4. Encoder processes prefix through self-attention, learning to incorporate prefix information
+
 ## Usage
 
-### Training with lerobot-train
+### Training with lerobot-train (RTC Enabled)
+
+```bash
+lerobot-train \
+    --policy.type act_relative_rtc \
+    --dataset.repo_id your/dataset \
+    --policy.chunk_size 50 \
+    --policy.use_rtc true \
+    --policy.rtc_max_delay 3 \
+    --steps 50000
+```
+
+### Training without RTC (Default)
 
 ```bash
 lerobot-train \
@@ -42,7 +80,8 @@ lerobot-train \
 Key configuration parameters in `ACTRelativeRTCConfig`:
 
 - `obs_state_delta_frames`: Number of frames back for computing observation delta (default: 1)
-- `use_rtc`: Reserved for future Real-Time Chunking implementation (default: False)
+- `use_rtc`: Enable Real-Time Chunking (training-time action prefix conditioning). When enabled, the model is trained with random action prefixes to simulate inference delays, improving chunk boundary consistency (default: False)
+ - `rtc_max_delay`: Maximum delay for RTC training. During training, per-sample delay is sampled uniformly from {0, ..., rtc_max_delay} (default: 3)
 - `chunk_size`: Action chunk size (default: 100)
 - `n_action_steps`: Number of actions to execute per inference (default: 100)
 
@@ -52,7 +91,7 @@ Key configuration parameters in `ACTRelativeRTCConfig`:
                     ┌─────────────────────────────────────┐
                     │          ACTRelativeRTCPolicy       │
                     └─────────────────────────────────────┘
-                                      │
+                                       │
         ┌─────────────────────────────┼─────────────────────────────┐
         ▼                             ▼                             ▼
 ┌───────────────┐           ┌─────────────────┐           ┌─────────────────┐
@@ -62,6 +101,12 @@ Key configuration parameters in `ACTRelativeRTCConfig`:
         │                             │                             │
         └──────── register_buffer ────┴──────── register_buffer ────┘
                   (mean, std)                   (mean, std)
+
+           RTC-only modules (when use_rtc=True):
+           ┌─────────────────────────────────────────┐
+           │  action_prefix_proj (Linear)        │  Projects action prefix to model dim
+           │  pad_embed (Parameter)             │  Learnable padding token
+           └─────────────────────────────────────────┘
 ```
 
 ### Relative Stats Computation

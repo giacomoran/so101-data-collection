@@ -300,6 +300,10 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
 
         Normalization is applied if relative stats were provided via set_relative_stats().
         """
+        if self.config.use_rtc:
+            raise ValueError(
+                "select_action is not supported for act_relative_rtc policies with use_rtc"
+            )
         self.eval()
 
         # Populate observation queue with current observation
@@ -358,8 +362,23 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         return action
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
-        """Predict a chunk of relative actions given observations with delta state."""
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        delay: int = 0,
+        action_prefix: Tensor | None = None,
+    ) -> Tensor:
+        """Predict a chunk of relative actions given observations with delta state.
+
+        Args:
+            batch: Dictionary containing observations including OBS_STATE with delta observation
+            delay: Number of action prefix steps to condition on (RTC). If action_prefix is
+                provided, its second dimension must equal delay.
+            action_prefix: Absolute action prefix from previous chunk, shape [batch, delay, action_dim]
+
+        Returns:
+            Predicted relative actions (normalized if has_relative_stats)
+        """
         self.eval()
 
         if self.config.image_features:
@@ -368,7 +387,31 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
             # During inference, they come directly from the robot without stacking
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
-        actions = self.model(batch)[0]
+        if action_prefix is not None and delay > 0:
+            assert action_prefix.shape[1] == delay
+            obs_state_t = batch[OBS_STATE]
+            batch_size = batch[OBS_STATE].shape[0]
+            action_prefix_relative = action_prefix - obs_state_t.unsqueeze(1)
+            if self.has_relative_stats:
+                action_prefix_relative = self.relative_action_normalizer(
+                    action_prefix_relative
+                )
+            action_prefix_relative_padded = torch.zeros(
+                (batch_size, self.config.rtc_max_delay, action_prefix.shape[2]),
+                dtype=action_prefix_relative.dtype,
+                device=action_prefix_relative.device,
+            )
+            action_prefix_relative_padded[:, :delay] = action_prefix_relative
+            delays = torch.full(
+                (batch_size,), delay, dtype=torch.long, device=batch[OBS_STATE].device
+            )
+        else:
+            action_prefix_relative_padded = None
+            delays = None
+
+        actions = self.model(
+            batch, action_prefix=action_prefix_relative_padded, delays=delays
+        )[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -382,6 +425,11 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         - delta_obs = obs[t] - obs[t-N]
         - relative_actions = action - obs[t]
         - Normalize both using registered relative stats (if available)
+
+        When use_rtc=True:
+        - Sample per-sample delay from {1, ..., rtc_max_delay}
+        - Extract action prefix (first delay steps) and condition model on it
+        - Mask loss to only compute on postfix (steps >= delay per sample)
         """
         # Extract obs[t-N] and obs[t] from stacked observations
         # obs.state shape: [batch, 2, state_dim]
@@ -416,14 +464,49 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
                 for key in self.config.image_features
             ]
 
-        # Forward through model to get predicted (normalized) relative actions
-        pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(training_batch)
+        if self.config.use_rtc and self.training:
+            batch_size = relative_actions.shape[0]
+            max_delay = self.config.rtc_max_delay
 
-        # Compute L1 loss on (normalized) relative actions
-        l1_loss = (
-            F.l1_loss(relative_actions, pred_relative_actions, reduction="none")
-            * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
+            delays = torch.randint(
+                0, max_delay + 1, (batch_size,), device=relative_actions.device
+            )
+
+            mask = (
+                torch.arange(max_delay, device=relative_actions.device)
+                < delays[:, None]
+            )
+            action_prefix_relative_padded = relative_actions[
+                :, :max_delay
+            ] * mask.unsqueeze(-1)
+
+            pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(
+                training_batch,
+                action_prefix=action_prefix_relative_padded,
+                delays=delays,
+            )
+
+            timesteps = torch.arange(
+                self.config.chunk_size, device=relative_actions.device
+            )
+            loss_mask = timesteps[None, :] >= delays[:, None]
+            loss_mask = loss_mask.unsqueeze(-1)
+
+            l1_loss_full = (
+                F.l1_loss(relative_actions, pred_relative_actions, reduction="none")
+                * ~batch["action_is_pad"].unsqueeze(-1)
+                * loss_mask
+            )
+            l1_loss = l1_loss_full.sum() / (loss_mask.sum() + 1e-8)
+        else:
+            pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(
+                training_batch
+            )
+
+            l1_loss = (
+                F.l1_loss(relative_actions, pred_relative_actions, reduction="none")
+                * ~batch["action_is_pad"].unsqueeze(-1)
+            ).mean()
 
         loss_dict = {"l1_loss": l1_loss.item()}
         if self.config.use_vae:
@@ -582,20 +665,40 @@ class ACTRelativeRTC(nn.Module):
             config.dim_model, self.config.action_feature.shape[0]
         )
 
+        if self.config.use_rtc:
+            action_dim = config.action_feature.shape[0]
+            self.action_prefix_proj = nn.Linear(action_dim, config.dim_model)
+            self.pad_embed = nn.Parameter(torch.zeros(config.dim_model))
+
         self._reset_parameters()
 
     def _reset_parameters(self):
         for p in chain(self.encoder.parameters(), self.decoder.parameters()):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+        if self.config.use_rtc:
+            nn.init.xavier_uniform_(self.action_prefix_proj.weight)
+            nn.init.zeros_(self.action_prefix_proj.bias)
 
     def forward(
-        self, batch: dict[str, Tensor]
+        self,
+        batch: dict[str, Tensor],
+        action_prefix: Tensor | None = None,
+        delays: Tensor | None = None,
     ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """Forward pass through ACT with relative positions.
 
         Note: batch[OBS_STATE] should already be the delta observation (obs[t] - obs[t-N])
         when called during training, or the delta computed from stored previous obs during inference.
+
+        Args:
+            action_prefix: Normalized relative action prefix from previous chunk or training batch.
+                Shape [batch_size, num_prefix_tokens, action_dim]. During training,
+                num_prefix_tokens = rtc_max_delay. During inference, num_prefix_tokens = delay.
+                Padding positions use learnable pad_token instead of zeros.
+            delays: Tensor of shape [batch_size] indicating actual delay per sample.
+                Used for loss masking in policy.forward(). Positions >= delays[i] in sample i
+                are computed in loss (postfix), positions < delays[i] are masked (prefix).
         """
         if self.config.use_vae and self.training:
             assert ACTION in batch, (
@@ -679,6 +782,36 @@ class ACTRelativeRTC(nn.Module):
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
+
+        if self.config.use_rtc:
+            assert action_prefix is not None
+            assert delays is not None
+            assert action_prefix.shape[1] > 0
+
+            num_prefix_tokens = action_prefix.shape[1]
+            action_prefix_embed = self.action_prefix_proj(action_prefix)
+            batch_size = action_prefix_embed.shape[0]
+
+            mask = (
+                torch.arange(num_prefix_tokens, device=action_prefix_embed.device)[
+                    None, :
+                ]
+                >= delays[:, None]
+            )
+            action_prefix_embed = torch.where(
+                mask.unsqueeze(-1),
+                self.pad_embed[None, None, :].expand_as(action_prefix_embed),
+                action_prefix_embed,
+            )
+            encoder_in_tokens.extend(list(action_prefix_embed.permute(1, 0, 2)))
+
+            num_positions_offset = len(encoder_in_pos_embed)
+            prefix_pos_embed = create_sinusoidal_pos_embedding(
+                num_positions_offset + num_prefix_tokens, self.config.dim_model
+            )[num_positions_offset:].to(
+                device=batch[OBS_STATE].device, dtype=encoder_in_tokens[0].dtype
+            )
+            encoder_in_pos_embed.extend(list(prefix_pos_embed.unsqueeze(1)))
 
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
