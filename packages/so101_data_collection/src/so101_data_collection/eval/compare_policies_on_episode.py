@@ -32,7 +32,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.utils import prepare_observation_for_inference
+from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.utils import init_logging
 
 # ============================================================================
@@ -184,7 +187,9 @@ def predict_action_chunk_absolute(
     policy: PreTrainedPolicy,
     sample: dict[str, Any],
     device: str,
+    preprocessor: PolicyProcessorPipeline | None = None,
     action_prefix: np.ndarray | None = None,
+    robot_type: str | None = None,
 ) -> tuple[np.ndarray, float]:
     """Predict an action chunk and convert to absolute positions.
 
@@ -194,7 +199,9 @@ def predict_action_chunk_absolute(
         policy: The policy to use for prediction
         sample: Dataset sample containing observations
         device: Device to run inference on
+        preprocessor: Preprocessor pipeline (required for proper input processing)
         action_prefix: Optional action prefix for RTC, shape [delay, action_dim]
+        robot_type: Robot type for prepare_observation_for_inference
 
     Returns:
         pred_actions_absolute: [chunk_size, action_dim] absolute joint positions
@@ -209,16 +216,77 @@ def predict_action_chunk_absolute(
         # Compute delta observation
         delta_obs = obs_t - obs_t_minus_1  # [state_dim]
 
-        # Prepare batch
-        batch = {
-            "observation.state": delta_obs.unsqueeze(0).to(device),  # [1, state_dim]
-        }
-
-        # Add images (use current frame, index 1)
+        # Build observation frame - must be numpy arrays for prepare_observation_for_inference
+        # Only include the keys needed for inference
+        observation_frame = {}
+        observation_frame["observation.state"] = obs_t.cpu().numpy()
         for key in sample:
-            if key.startswith("observation.images."):
-                img = sample[key]  # [2, C, H, W]
-                batch[key] = img[1:2].to(device)  # [1, C, H, W] - current frame
+            if key.startswith("observation.images.") and not key.endswith("_is_pad"):
+                img = sample[key]
+                # Handle different formats
+                if isinstance(img, torch.Tensor):
+                    if img.ndim == 4:  # [2, C, H, W] or [2, H, W, C] stacked
+                        img = img[1]  # Take current frame
+                    elif img.ndim == 3:  # Already single frame
+                        pass
+                    # Convert numpy to handle both (C,H,W) and (H,W,C) formats
+                    img_np = img.cpu().numpy()
+                    # Check format and convert to (H,W,C) if needed
+                    if img_np.shape[0] == 3 and img_np.shape[1] > 3:  # (C,H,W) format
+                        # Permute to (H,W,C)
+                        img_np = np.transpose(img_np, (1, 2, 0))
+                    observation_frame[key] = img_np
+                elif isinstance(img, list):
+                    # Handle list format [img_1, img_2]
+                    if len(img) > 1:
+                        img_current = img[1]
+                    else:
+                        img_current = img[0]
+                    img_np = np.array(img_current)
+                    if img_np.shape[0] == 3 and img_np.shape[1] > 3:  # (C,H,W) format
+                        img_np = np.transpose(img_np, (1, 2, 0))
+                    observation_frame[key] = img_np
+                else:
+                    img_np = np.array(img)
+                    if img_np.shape[0] == 3 and img_np.shape[1] > 3:  # (C,H,W) format
+                        img_np = np.transpose(img_np, (1, 2, 0))
+                    observation_frame[key] = img_np
+
+        # Prepare observation and apply preprocessor if provided
+        if preprocessor is not None:
+            # prepare_observation_for_inference converts numpy to torch, then
+            # for images: (H,W,C) -> (C,H,W) and adds batch dimension
+            # observation_frame should only contain observation.state and observation.images.* keys
+            for k, v in observation_frame.items():
+                if not isinstance(v, np.ndarray):
+                    raise ValueError(
+                        f"observation_frame['{k}'] is {type(v)}, expected np.ndarray. "
+                        f"This may happen if sample has unexpected values."
+                    )
+            observation = prepare_observation_for_inference(
+                observation_frame, device, None, robot_type
+            )
+            observation = preprocessor(observation)
+
+            # Normalize delta observation if stats are available
+            if policy.has_relative_stats:
+                delta_obs_normalized = policy.delta_obs_normalizer(delta_obs.to(device))
+            else:
+                delta_obs_normalized = delta_obs.to(device)
+
+            # Create inference batch with delta observation
+            batch = dict(observation)
+            batch["observation.state"] = delta_obs_normalized.unsqueeze(0)  # [1, state_dim]
+        else:
+            # Fallback: no preprocessor (legacy behavior)
+            batch = {
+                "observation.state": delta_obs.unsqueeze(0).to(device),  # [1, state_dim]
+            }
+            for key in sample:
+                if key.startswith("observation.images."):
+                    img = sample[key]  # [2, H, W, C] from LeRobot dataset
+                    # Use current frame (index 1) and add batch dimension
+                    batch[key] = img[1].unsqueeze(0).to(device)  # [1, H, W, C] - current frame
 
         # Run inference
         start_time = time.perf_counter()
@@ -239,6 +307,10 @@ def predict_action_chunk_absolute(
                 relative_actions = policy.predict_action_chunk(batch)  # [1, chunk_size, action_dim]
         inference_time = time.perf_counter() - start_time
 
+        # Unnormalize relative actions if stats are available
+        if preprocessor is not None and policy.has_relative_stats:
+            relative_actions = policy.relative_action_normalizer.inverse(relative_actions)
+
         # Convert relative to absolute: action_abs = action_rel + obs[t]
         obs_t_expanded = obs_t.unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, state_dim]
         absolute_actions = (
@@ -258,12 +330,16 @@ def predict_action_chunk_absolute(
             batch["observation.state"] = obs_state.unsqueeze(0).to(device)
 
         for key in sample:
-            if key.startswith("observation.images."):
+            if key.startswith("observation.images.") and not key.endswith("_is_pad"):
                 img = sample[key]
-                # Handle both stacked [2, C, H, W] and single [C, H, W] formats
-                if img.ndim == 4:  # [2, C, H, W] stacked
-                    img = img[-1]  # Take current frame [C, H, W]
-                batch[key] = img.unsqueeze(0).to(device)  # [1, C, H, W]
+                # Handle both stacked [2, C, H, W] or [2, H, W, C] and single [C, H, W] or [H, W, C] formats
+                if img.ndim == 4:  # [2, C, H, W] or [2, H, W, C] stacked
+                    img = img[-1]  # Take current frame
+                batch[key] = img.unsqueeze(0).to(device)  # [1, C, H, W] or [1, H, W, C]
+
+        # Apply preprocessor if provided
+        if preprocessor is not None:
+            batch = preprocessor(batch)
 
         start_time = time.perf_counter()
         with torch.no_grad():
@@ -308,6 +384,8 @@ def run_comparison_for_episode(
     cfg: ComparePoliciesConfig,
     episode_idx: int,
     ds_meta: LeRobotDatasetMetadata,
+    preprocessors: list[PolicyProcessorPipeline],
+    robot_type: str,
 ):
     """Run comparison for a single episode."""
     fps = ds_meta.fps
@@ -433,7 +511,12 @@ def run_comparison_for_episode(
                 action_prefix = gt_chunk[:prefix_len]
 
             pred_chunk, inference_time = predict_action_chunk_absolute(
-                policy, sample, cfg.device, action_prefix=action_prefix
+                policy,
+                sample,
+                cfg.device,
+                preprocessor=preprocessors[idx_policy],
+                action_prefix=action_prefix,
+                robot_type=robot_type,
             )
             all_inference_times[name].append(inference_time)
 
@@ -612,9 +695,11 @@ def run_comparison(cfg: ComparePoliciesConfig):
     # Load all policies
     policies = []
     policy_names = []
+    policy_paths = []
     for path_str in cfg.policy_paths:
         policy, policy_type = load_policy_from_path(path_str, cfg.device)
         policies.append(policy)
+        policy_paths.append(path_str)
         # Create a clean label, removing "pretrained_model" if present
         path = Path(path_str)
         # Handle both local paths and HuggingFace repo IDs
@@ -657,9 +742,32 @@ def run_comparison(cfg: ComparePoliciesConfig):
     # Load dataset metadata
     ds_meta = LeRobotDatasetMetadata(cfg.dataset_repo_id)
 
+    # Create preprocessors for each policy
+    preprocessors = []
+    for policy, path_str in zip(policies, policy_paths):
+        # Override device processor to use the detected device
+        preprocessor_overrides = {
+            "device_processor": {"device": str(policy.config.device)},
+        }
+
+        preprocessor, _ = make_pre_post_processors(
+            policy_cfg=policy.config,
+            pretrained_path=path_str,
+            preprocessor_overrides=preprocessor_overrides,
+        )
+        preprocessors.append(preprocessor)
+        logging.info(f"Created preprocessor for policy: {policy.config.type}")
+
+    # Get robot type (for prepare_observation_for_inference)
+    # Default to so101_follower as it's the most common for this project
+    robot_type = "so101_follower"
+    logging.info(f"Using robot_type: {robot_type}")
+
     # Run comparison for each episode
     for episode_idx in cfg.dataset_episode_idx:
-        run_comparison_for_episode(policies, policy_names, cfg, episode_idx, ds_meta)
+        run_comparison_for_episode(
+            policies, policy_names, cfg, episode_idx, ds_meta, preprocessors, robot_type
+        )
 
 
 @draccus.wrap()
