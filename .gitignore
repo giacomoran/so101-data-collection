@@ -68,7 +68,6 @@ dmypy.json
 
 # Data files (common patterns)
 *.csv
-*.json
 *.parquet
 *.h5
 *.hdf5
