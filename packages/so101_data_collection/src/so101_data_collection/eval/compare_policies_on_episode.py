@@ -77,14 +77,13 @@ def load_policy_from_path(
     path = Path(pretrained_name_or_path)
 
     # Check if it's a local path or HuggingFace repo ID
-    is_local_path = path.exists() or (
-        path.parent.exists() and (path / "config.json").exists()
-    )
+    # If it has multiple path segments, it's likely a local path
+    is_local_path = len(path.parts) > 1 or path.exists()
 
     # Determine policy type from config
     if is_local_path:
         # Local path - check if it's a directory with config.json
-        if path.is_dir():
+        if path.is_dir() and (path / "config.json").exists():
             config_path = path / "config.json"
         elif path.parent.is_dir() and (path.parent / "config.json").exists():
             # Path might be to model.safetensors, use parent
@@ -185,10 +184,17 @@ def predict_action_chunk_absolute(
     policy: PreTrainedPolicy,
     sample: dict[str, Any],
     device: str,
+    action_prefix: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
     """Predict an action chunk and convert to absolute positions.
 
     Handles both absolute (ACT) and relative (ACT Relative RTC) action representations.
+
+    Args:
+        policy: The policy to use for prediction
+        sample: Dataset sample containing observations
+        device: Device to run inference on
+        action_prefix: Optional action prefix for RTC, shape [delay, action_dim]
 
     Returns:
         pred_actions_absolute: [chunk_size, action_dim] absolute joint positions
@@ -217,9 +223,19 @@ def predict_action_chunk_absolute(
         # Run inference
         start_time = time.perf_counter()
         with torch.no_grad():
-            relative_actions = policy.predict_action_chunk(
-                batch
-            )  # [1, chunk_size, action_dim]
+            if action_prefix is not None and policy.config.use_rtc:
+                action_prefix_tensor = (
+                    torch.from_numpy(action_prefix).unsqueeze(0).to(device)
+                )  # [1, delay, action_dim]
+                relative_actions = policy.predict_action_chunk(
+                    batch,
+                    delay=action_prefix.shape[0],
+                    action_prefix=action_prefix_tensor,
+                )  # [1, chunk_size, action_dim]
+            else:
+                relative_actions = policy.predict_action_chunk(
+                    batch
+                )  # [1, chunk_size, action_dim]
         inference_time = time.perf_counter() - start_time
 
         # Convert relative to absolute: action_abs = action_rel + obs[t]
@@ -272,6 +288,7 @@ class ComparePoliciesConfig:
     dataset_episode_idx: list[int] = field(default_factory=lambda: [0])
     device: str | None = None
     plot_interval: float = 1.0
+    rtc_delay: int = 0
 
     def __post_init__(self):
         if not self.policy_paths:
@@ -304,6 +321,7 @@ def run_comparison_for_episode(
     logging.info(f"\n{'=' * 60}")
     logging.info(f"Episode {episode_idx}: {num_frames} frames at {fps} fps")
     logging.info(f"  Dataset indices: [{from_idx}, {to_idx})")
+    logging.info(f"  RTC delay: {cfg.rtc_delay}")
     logging.info(f"{'=' * 60}")
 
     # Get action dimension
@@ -407,9 +425,14 @@ def run_comparison_for_episode(
         if isinstance(gt_chunk, torch.Tensor):
             gt_chunk = gt_chunk.numpy()
 
-        for policy, name in zip(policies, policy_names):
+        for idx_policy, (policy, name) in enumerate(zip(policies, policy_names)):
+            action_prefix = None
+            if cfg.rtc_delay > 0 and len(gt_chunk) > 0 and policy.config.use_rtc:
+                prefix_len = min(cfg.rtc_delay, len(gt_chunk))
+                action_prefix = gt_chunk[:prefix_len]
+
             pred_chunk, inference_time = predict_action_chunk_absolute(
-                policy, sample, cfg.device
+                policy, sample, cfg.device, action_prefix=action_prefix
             )
             all_inference_times[name].append(inference_time)
 
@@ -615,6 +638,16 @@ def run_comparison(cfg: ComparePoliciesConfig):
     if not policies:
         logging.error("No policies loaded!")
         return
+
+    # Validate rtc_delay against policy configs
+    for policy, policy_type in zip(policies, policy_names):
+        if hasattr(policy.config, "use_rtc") and policy.config.use_rtc:
+            max_delay = policy.config.rtc_max_delay
+            if cfg.rtc_delay > max_delay:
+                raise ValueError(
+                    f"rtc_delay ({cfg.rtc_delay}) exceeds rtc_max_delay ({max_delay}) "
+                    f"for policy {policy_type}"
+                )
 
     # Get chunk_size from first policy (assume consistent across policies)
     chunk_size = policies[0].config.chunk_size

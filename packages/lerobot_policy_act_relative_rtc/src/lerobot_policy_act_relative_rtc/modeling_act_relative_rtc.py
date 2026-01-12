@@ -497,7 +497,10 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
                 * ~batch["action_is_pad"].unsqueeze(-1)
                 * loss_mask
             )
-            l1_loss = l1_loss_full.sum() / (loss_mask.sum() + 1e-8)
+            per_sample_loss = l1_loss_full.sum(dim=(1, 2)) / (
+                loss_mask.sum(dim=1) + 1e-8
+            )
+            l1_loss = per_sample_loss.mean()
         else:
             pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(
                 training_batch
