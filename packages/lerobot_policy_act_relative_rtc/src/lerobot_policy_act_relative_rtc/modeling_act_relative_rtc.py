@@ -786,11 +786,7 @@ class ACTRelativeRTC(nn.Module):
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
 
-        if self.config.use_rtc:
-            assert action_prefix is not None
-            assert delays is not None
-            assert action_prefix.shape[1] > 0
-
+        if self.config.use_rtc and action_prefix is not None and delays is not None and action_prefix.shape[1] > 0:
             num_prefix_tokens = action_prefix.shape[1]
             action_prefix_embed = self.action_prefix_proj(action_prefix)
             batch_size = action_prefix_embed.shape[0]

@@ -223,19 +223,20 @@ def predict_action_chunk_absolute(
         # Run inference
         start_time = time.perf_counter()
         with torch.no_grad():
-            if action_prefix is not None and policy.config.use_rtc:
+            if policy.config.use_rtc and action_prefix is not None:
+                # Only pass action_prefix and delay when we have actual prefix data
                 action_prefix_tensor = (
                     torch.from_numpy(action_prefix).unsqueeze(0).to(device)
                 )  # [1, delay, action_dim]
+                delay = action_prefix.shape[0]
                 relative_actions = policy.predict_action_chunk(
                     batch,
-                    delay=action_prefix.shape[0],
+                    delay=delay,
                     action_prefix=action_prefix_tensor,
                 )  # [1, chunk_size, action_dim]
             else:
-                relative_actions = policy.predict_action_chunk(
-                    batch
-                )  # [1, chunk_size, action_dim]
+                # No RTC prefix (either use_rtc=False or rtc_delay=0)
+                relative_actions = policy.predict_action_chunk(batch)  # [1, chunk_size, action_dim]
         inference_time = time.perf_counter() - start_time
 
         # Convert relative to absolute: action_abs = action_rel + obs[t]
