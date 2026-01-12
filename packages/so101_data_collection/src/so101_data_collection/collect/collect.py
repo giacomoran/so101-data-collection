@@ -615,6 +615,7 @@ def collect(config: CollectConfig) -> None:
         f"Starting data collection: task={config.task.value}, setup={config.setup.value}"
     )
     if config.is_benchmark_mode:
+        assert config.benchmark_time_s is not None
         logger.info(
             f"BENCHMARK MODE: {config.benchmark_time_s / 60:.1f} minutes, RAM-only (no encoding during collection)"
         )
@@ -687,6 +688,10 @@ def collect(config: CollectConfig) -> None:
         elif config.setup == Setup.PHONE_TELEOP:
             raise NotImplementedError("Phone teleop not yet implemented")
 
+        assert arm is not None
+        assert robot is not None
+        assert leader is not None
+
         # Connect cameras
         for cam in cameras.values():
             cam.connect()
@@ -701,11 +706,13 @@ def collect(config: CollectConfig) -> None:
         # Determine loop condition based on mode
         def should_continue() -> bool:
             if config.is_benchmark_mode:
+                assert config.benchmark_time_s is not None
                 return (
                     session_elapsed < config.benchmark_time_s
                     and not events["stop_recording"]
                 )
             else:
+                assert config.num_episodes is not None
                 return (
                     recorded_episodes < config.num_episodes
                     and not events["stop_recording"]
@@ -714,6 +721,7 @@ def collect(config: CollectConfig) -> None:
         while should_continue():
             episode_num = recorded_episodes + 1
             if config.is_benchmark_mode:
+                assert config.benchmark_time_s is not None
                 remaining_min = (config.benchmark_time_s - session_elapsed) / 60
                 log_say(
                     f"Recording episode {episode_num} ({remaining_min:.1f} min remaining)",

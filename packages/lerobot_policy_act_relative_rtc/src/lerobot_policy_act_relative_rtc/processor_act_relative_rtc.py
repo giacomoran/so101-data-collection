@@ -229,6 +229,8 @@ def make_act_relative_rtc_pre_post_processors(
         tuple: A tuple containing the pre-processor pipeline and the post-processor pipeline.
     """
 
+    assert config.device is not None
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),

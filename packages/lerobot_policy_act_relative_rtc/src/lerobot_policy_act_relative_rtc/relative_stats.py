@@ -16,7 +16,6 @@ import logging
 from typing import Any
 
 import numpy as np
-import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -126,4 +125,3 @@ def compute_relative_stats(
         "delta_obs": delta_obs_stats,
         "relative_action": relative_action_stats,
     }
-

@@ -6,7 +6,6 @@ Run this to ensure both libraries pick up the Nix-installed FFmpeg 7.x.
 
 import shutil
 import subprocess
-import sys
 
 
 def section(title: str) -> None:
@@ -114,7 +113,7 @@ def main() -> None:
 
         # Check video backend
         try:
-            from torchvision.io import VideoReader
+            from torchvision.io import VideoReader  # noqa: F401
 
             print(f"VideoReader available: ✓ YES")
         except ImportError as e:
@@ -129,7 +128,7 @@ def main() -> None:
 
         # Try to get video capabilities
         try:
-            from torchvision.io import _video_opt
+            from torchvision.io import _video_opt  # noqa: F401
 
             print(f"_video_opt module: ✓ available")
         except ImportError:
@@ -197,7 +196,7 @@ def main() -> None:
             issues.append(
                 f"PyAV linked against old FFmpeg (libavcodec {major}.x, need 60+)"
             )
-    except:
+    except Exception as _:
         issues.append("Could not verify PyAV FFmpeg version")
 
     if issues:

@@ -5,3 +5,11 @@ no-binary-package = ["av"]
 
 [tool.uv.workspace]
 members = ["packages/*"]
+
+[dependency-groups]
+dev = ["ruff>=0.14.11"]
+
+[tool.ruff.lint]
+ignore = [
+    "F541", # f-string without any placeholders
+]

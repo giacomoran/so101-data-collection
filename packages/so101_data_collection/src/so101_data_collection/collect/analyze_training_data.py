@@ -16,11 +16,8 @@ Usage:
         --dataset-episode-idx=[0,1,2,3,4]
 """
 
-import argparse
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -69,8 +66,6 @@ def load_episode_with_deltas(
         - relative_actions_single: [num_frames, action_dim] relative actions (first timestep only)
     """
     fps = ds_meta.fps
-    state_dim = len(JOINT_NAMES)
-    action_dim = state_dim  # SO-101 has 6-DOF for both state and action
 
     # Build delta_timestamps matching ACT Relative RTC configuration
     # We need obs[t-1] and obs[t] for delta computation
@@ -133,21 +128,31 @@ def load_episode_with_deltas(
         # Compute relative_action = action - obs[t] (matches modeling_act_relative_rtc.py line 397)
         # obs_t shape: [state_dim] -> [1, state_dim] for broadcasting
         # action_chunk shape: [chunk_size, action_dim]
-        relative_action_chunk = action_chunk - obs_t[np.newaxis, :]  # [chunk_size, action_dim]
+        relative_action_chunk = (
+            action_chunk - obs_t[np.newaxis, :]
+        )  # [chunk_size, action_dim]
 
         # Store
         obs_state_list.append(obs_t)
         delta_obs_list.append(delta_obs)
         action_chunks_list.append(action_chunk)
         relative_action_chunks_list.append(relative_action_chunk)
-        relative_actions_single_list.append(relative_action_chunk[0])  # First timestep only
+        relative_actions_single_list.append(
+            relative_action_chunk[0]
+        )  # First timestep only
 
     return {
         "obs_state": np.array(obs_state_list),  # [num_frames, state_dim]
         "delta_obs": np.array(delta_obs_list),  # [num_frames, state_dim]
-        "action_chunks": np.array(action_chunks_list),  # [num_frames, chunk_size, action_dim]
-        "relative_action_chunks": np.array(relative_action_chunks_list),  # [num_frames, chunk_size, action_dim]
-        "relative_actions_single": np.array(relative_actions_single_list),  # [num_frames, action_dim]
+        "action_chunks": np.array(
+            action_chunks_list
+        ),  # [num_frames, chunk_size, action_dim]
+        "relative_action_chunks": np.array(
+            relative_action_chunks_list
+        ),  # [num_frames, chunk_size, action_dim]
+        "relative_actions_single": np.array(
+            relative_actions_single_list
+        ),  # [num_frames, action_dim]
     }
 
 
@@ -198,8 +203,16 @@ def plot_delta_obs_distribution(
         p5, p95 = np.percentile(deltas, [5, 95])
         min_val, max_val = deltas.min(), deltas.max()
 
-        ax.axvline(mean, color="red", linestyle="--", linewidth=2, label=f"Mean: {mean:.4f}")
-        ax.axvline(median, color="green", linestyle="--", linewidth=2, label=f"Median: {median:.4f}")
+        ax.axvline(
+            mean, color="red", linestyle="--", linewidth=2, label=f"Mean: {mean:.4f}"
+        )
+        ax.axvline(
+            median,
+            color="green",
+            linestyle="--",
+            linewidth=2,
+            label=f"Median: {median:.4f}",
+        )
         ax.axvline(0, color="black", linestyle="-", linewidth=0.5, alpha=0.5)
 
         ax.set_xlabel("Delta (rad)", fontsize=10)
@@ -351,7 +364,9 @@ def plot_relative_action_chunks_over_time(
     Returns:
         Figure object
     """
-    relative_action_chunks = episode_data["relative_action_chunks"]  # [num_frames, chunk_size, action_dim]
+    relative_action_chunks = episode_data[
+        "relative_action_chunks"
+    ]  # [num_frames, chunk_size, action_dim]
     num_frames, _, num_joints = relative_action_chunks.shape
 
     # Color map for chunks
@@ -446,7 +461,9 @@ def plot_relative_action_chunks_first_k(
 
         for ep_idx, (ep_data, color) in enumerate(zip(all_episode_data, colors)):
             relative_action_chunks = ep_data["relative_action_chunks"]
-            num_chunks_to_plot = min(max_chunks_per_episode, len(relative_action_chunks))
+            num_chunks_to_plot = min(
+                max_chunks_per_episode, len(relative_action_chunks)
+            )
 
             for chunk_idx in range(num_chunks_to_plot):
                 chunk = relative_action_chunks[chunk_idx, :, joint_idx]
@@ -530,8 +547,12 @@ def run_analysis(cfg: AnalyzeTrainingDataConfig):
 
     # Concatenate across episodes
     all_delta_obs = np.concatenate(all_delta_obs, axis=0)  # [total_frames, state_dim]
-    all_relative_action_chunks = np.concatenate(all_relative_action_chunks, axis=0)  # [total_frames, chunk_size, action_dim]
-    all_relative_actions_single = np.concatenate(all_relative_actions_single, axis=0)  # [total_frames, action_dim]
+    all_relative_action_chunks = np.concatenate(
+        all_relative_action_chunks, axis=0
+    )  # [total_frames, chunk_size, action_dim]
+    all_relative_actions_single = np.concatenate(
+        all_relative_actions_single, axis=0
+    )  # [total_frames, action_dim]
 
     logging.info(f"Total frames across all episodes: {len(all_delta_obs)}")
     logging.info("")
@@ -541,11 +562,11 @@ def run_analysis(cfg: AnalyzeTrainingDataConfig):
 
     # Plot 1: Delta observation distribution
     logging.info("  Plotting delta observation distribution...")
-    fig1 = plot_delta_obs_distribution(all_delta_obs, cfg.dataset_episode_idx)
+    plot_delta_obs_distribution(all_delta_obs, cfg.dataset_episode_idx)
 
     # Plot 2: Relative action distribution
     logging.info("  Plotting relative action distribution...")
-    fig2 = plot_relative_action_distribution(
+    plot_relative_action_distribution(
         all_relative_action_chunks,
         all_relative_actions_single,
         cfg.dataset_episode_idx,
@@ -554,7 +575,7 @@ def run_analysis(cfg: AnalyzeTrainingDataConfig):
 
     # Plot 3: Relative action chunks for first episode (overview)
     logging.info("  Plotting relative action chunks for first episode...")
-    fig3 = plot_relative_action_chunks_over_time(
+    plot_relative_action_chunks_over_time(
         all_episode_data[0],
         cfg.dataset_episode_idx[0],
         cfg.chunk_size,
@@ -562,7 +583,7 @@ def run_analysis(cfg: AnalyzeTrainingDataConfig):
 
     # Plot 4: First K chunks per episode (cross-episode comparison)
     logging.info("  Plotting first K chunks per episode...")
-    fig4 = plot_relative_action_chunks_first_k(
+    plot_relative_action_chunks_first_k(
         all_episode_data,
         cfg.dataset_episode_idx,
         cfg.chunk_size,
@@ -619,4 +640,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
