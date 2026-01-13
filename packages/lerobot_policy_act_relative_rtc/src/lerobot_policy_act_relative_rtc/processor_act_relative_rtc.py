@@ -21,7 +21,7 @@ The relative position transformations are handled in the model's forward pass,
 not in the processor.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -53,180 +53,111 @@ from .configuration_act_relative_rtc import ACTRelativeRTCConfig
 @ProcessorStepRegistry.register("image_pad_square_resize_processor")
 @dataclass
 class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
-    """
-    Pads images to square with black borders and resizes to a specified resolution.
+    """Pads images to square with black borders and resizes to a specified resolution.
 
-    This step applies the following transformations to all image observations:
-    1. If downscale_img_square is None, do nothing.
-    2. Convert image to float32 if needed.
-    3. Pad the image with constant black borders to make it square.
-    4. Downscale the image using area interpolation to the desired resolution.
+    This step is only added to the pipeline when resizing is actually needed
+    (determined at pipeline construction time by comparing downscale_img_square
+    with dataset image dimensions).
 
     Attributes:
-        downscale_img_square: The target square resolution (e.g., 224 for 224x224).
-                              If None, no transformation is applied.
+        target_resolution: The target square resolution (e.g., 224 for 224x224).
+        keys_image: List of image keys to process.
     """
 
-    downscale_img_square: int | None = None
-    _cached_hw: tuple[int, int] | None = None
-    _cached_scale: float | None = None
-    _cached_resize_hw: tuple[int, int] | None = None
-    _cached_padding: tuple[int, int, int, int] | None = None
-    _cached_ndim: int | None = None
-    _cached_is_mps: bool | None = None
+    target_resolution: int = 224
+    keys_image: list[str] = field(default_factory=list)
+
+    # Cached resize parameters (computed on first call)
+    _hw_resize: tuple[int, int] | None = None
+    _padding: tuple[int, int, int, int] | None = None
 
     def observation(self, observation: dict) -> dict:
-        """
-        Applies padding and resizing to all images in the observation dictionary.
-
-        Args:
-            observation: The observation dictionary containing image tensors.
-                         Images are expected to have shape (1, C, H, W), (T, C, H, W),
-                         or (B, T, C, H, W) after AddBatchDimensionProcessorStep.
-
-        Returns:
-            A new observation dictionary with transformed images.
-        """
-        if self.downscale_img_square is None:
-            return observation
-
         new_observation = dict(observation)
 
-        # Process all image keys in the observation
-        for key in observation:
-            if "image" not in key:
-                continue
-
+        for key in self.keys_image:
             image = observation[key]
 
-            # Skip non-tensor values or tensors that don't look like images
-            if not isinstance(image, torch.Tensor):
-                continue
-
-            original_ndim = len(image.shape)
-            # Only process tensors with 4 or 5 dimensions (actual images)
-            # Skip 2D/3D tensors that might have "image" in their key name
-            if original_ndim not in (4, 5):
-                continue
-
-            # Ensure image is float32 tensor (interpolate requires float)
-            if image.dtype != torch.float32:
-                if image.dtype == torch.uint8:
-                    image = image.float() / 255.0
-                else:
-                    image = image.float()
-
-            device = image.device
-
-            # Normalize to (N, C, H, W) format for processing
-            # After AddBatchDimensionProcessorStep, we only see 4D or 5D shapes
-            restore_5d = False
-            if original_ndim == 4:
-                # (1, C, H, W) or (T, C, H, W) -> already in (N, C, H, W) format
-                # No reshaping needed
-                pass
-            elif original_ndim == 5:
-                # (B, T, C, H, W) -> flatten to (B*T, C, H, W)
-                B, T, C, H, W = image.shape
+            # Flatten 5D (B, T, C, H, W) to 4D (B*T, C, H, W) for processing
+            shape_original = image.shape
+            if len(shape_original) == 5:
+                B, T, C, H, W = shape_original
                 image = image.view(B * T, C, H, W)
-                restore_5d = True
-                original_B, original_T = B, T
+            else:
+                _, C, H, W = shape_original
 
-            # Now image is (N, C, H, W) where N >= 1
-            N, C, H, W = image.shape
+            # Cache resize parameters on first call
+            if self._hw_resize is None:
+                scale = self.target_resolution / max(H, W)
+                h_new, w_new = int(H * scale), int(W * scale)
+                self._hw_resize = (h_new, w_new)
 
-            # Early exit: if image is already at target resolution, skip processing
-            # This handles preprocessed datasets where videos are already resized
-            if H == self.downscale_img_square and W == self.downscale_img_square:
-                new_observation[key] = observation[key]
-                continue
+                h_pad = self.target_resolution - h_new
+                w_pad = self.target_resolution - w_new
+                self._padding = (w_pad // 2, h_pad // 2, w_pad - w_pad // 2, h_pad - h_pad // 2)
 
-            # Cache parameters on first call
-            if self._cached_hw is None:
-                self._cached_hw = (H, W)
-                self._cached_ndim = original_ndim
-                self._cached_is_mps = device.type == "mps"
-
-                # Optimized approach: resize first (preserve aspect ratio), then pad
-                scale = self.downscale_img_square / max(H, W)
-                self._cached_scale = scale
-                new_h = int(H * scale)
-                new_w = int(W * scale)
-                self._cached_resize_hw = (new_h, new_w)
-
-                pad_h = self.downscale_img_square - new_h
-                pad_w = self.downscale_img_square - new_w
-                padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
-                self._cached_padding = padding
-
-            # Move to CPU for interpolation if on MPS (MPS has issues with some operations)
-            if self._cached_is_mps:
-                image = image.cpu()
-
-            # Resize first (preserving aspect ratio) - faster than padding then resizing
-            if self._cached_resize_hw is not None:
-                image = torch.nn.functional.interpolate(
-                    image,
-                    size=self._cached_resize_hw,
-                    mode="bilinear",
-                    align_corners=False,
-                )
+            # Resize (preserving aspect ratio)
+            image = torch.nn.functional.interpolate(image, size=self._hw_resize, mode="bilinear", align_corners=False)
 
             # Pad to square
-            if self._cached_padding is not None:
-                image = F.pad(image, self._cached_padding, fill=0, padding_mode="constant")
+            image = F.pad(image, self._padding, fill=0, padding_mode="constant")
 
-            # Restore original shape if needed (only for 5D case)
-            if restore_5d:
-                # Restore (B, T, C, H, W) from (B*T, C, H, W)
-                image = image.view(original_B, original_T, C, image.shape[-2], image.shape[-1])
-
-            # Move back to original device
-            if self._cached_is_mps:
-                image = image.to(device)
+            # Restore 5D shape if needed
+            if len(shape_original) == 5:
+                image = image.view(B, T, C, self.target_resolution, self.target_resolution)
 
             new_observation[key] = image
 
         return new_observation
 
     def get_config(self) -> dict[str, Any]:
-        """
-        Returns the configuration of the step for serialization.
-
-        Returns:
-            A dictionary containing the downscale_img_square parameter.
-        """
         return {
-            "downscale_img_square": self.downscale_img_square,
+            "target_resolution": self.target_resolution,
+            "keys_image": self.keys_image,
         }
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        """
-        Updates the image feature shapes if resizing is applied.
-
-        Args:
-            features: The policy features dictionary.
-
-        Returns:
-            The updated policy features dictionary with new image shapes.
-        """
-        if self.downscale_img_square is None:
-            return features
-
-        for key in features[PipelineFeatureType.OBSERVATION]:
-            if "image" in key:
+        for key in self.keys_image:
+            if key in features[PipelineFeatureType.OBSERVATION]:
                 nb_channel = features[PipelineFeatureType.OBSERVATION][key].shape[0]
                 features[PipelineFeatureType.OBSERVATION][key] = PolicyFeature(
                     type=features[PipelineFeatureType.OBSERVATION][key].type,
-                    shape=(
-                        nb_channel,
-                        self.downscale_img_square,
-                        self.downscale_img_square,
-                    ),
+                    shape=(nb_channel, self.target_resolution, self.target_resolution),
                 )
         return features
+
+
+def _get_keys_image_needing_resize(
+    config: ACTRelativeRTCConfig,
+) -> list[str]:
+    """Get list of image keys that need resizing.
+
+    Returns empty list if:
+    - downscale_img_square is None
+    - All images are already at target resolution
+
+    Args:
+        config: Policy config with input_features and downscale_img_square.
+
+    Returns:
+        List of image feature keys that need resizing.
+    """
+    if config.downscale_img_square is None:
+        return []
+
+    target = config.downscale_img_square
+    keys_needing_resize = []
+
+    for key, feature in config.input_features.items():
+        if "image" not in key:
+            continue
+        # Feature shape is (C, H, W)
+        _, H, W = feature.shape
+        if H != target or W != target:
+            keys_needing_resize.append(key)
+
+    return keys_needing_resize
 
 
 def make_act_relative_rtc_pre_post_processors(
@@ -258,7 +189,6 @@ def make_act_relative_rtc_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
-        ImagePadSquareResizeProcessorStep(downscale_img_square=config.downscale_img_square),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
@@ -266,6 +196,19 @@ def make_act_relative_rtc_pre_post_processors(
             device=config.device,
         ),
     ]
+
+    # Only add image resize step if images actually need resizing.
+    # Skip if: downscale_img_square is None, or images are already at target resolution.
+    keys_image = _get_keys_image_needing_resize(config)
+    if keys_image:
+        input_steps.insert(
+            3,  # After DeviceProcessorStep
+            ImagePadSquareResizeProcessorStep(
+                target_resolution=config.downscale_img_square,
+                keys_image=keys_image,
+            ),
+        )
+
     output_steps = [
         UnnormalizerProcessorStep(
             features=config.output_features,
