@@ -190,28 +190,26 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         with open(path_relative_stats) as f:
             stats_json = json.load(f)
 
-        # Validate config compatibility
+        # Validate config compatibility - these MUST match or stats are invalid
         config_stored = stats_json.get("config", {})
         obs_delta_frames_stored = config_stored.get("obs_state_delta_frames")
         chunk_size_stored = config_stored.get("chunk_size")
 
         if obs_delta_frames_stored is not None:
             if obs_delta_frames_stored != self.config.obs_state_delta_frames:
-                logging.warning(
+                raise ValueError(
                     f"Precomputed stats obs_state_delta_frames ({obs_delta_frames_stored}) "
-                    f"differs from config ({self.config.obs_state_delta_frames}). "
-                    "Falling back to computing stats."
+                    f"differs from training config ({self.config.obs_state_delta_frames}). "
+                    "Re-run preprocess_dataset.py with matching --obs-state-delta-frames."
                 )
-                return False
 
         if chunk_size_stored is not None:
             if chunk_size_stored != self.config.chunk_size:
-                logging.warning(
+                raise ValueError(
                     f"Precomputed stats chunk_size ({chunk_size_stored}) "
-                    f"differs from config ({self.config.chunk_size}). "
-                    "Falling back to computing stats."
+                    f"differs from training config ({self.config.chunk_size}). "
+                    "Re-run preprocess_dataset.py with matching --chunk-size."
                 )
-                return False
 
         # Convert lists to numpy arrays and set stats
         stats = {
