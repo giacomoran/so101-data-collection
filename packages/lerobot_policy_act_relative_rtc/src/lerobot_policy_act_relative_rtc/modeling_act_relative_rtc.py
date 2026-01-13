@@ -25,9 +25,14 @@ Key changes from standard ACT:
 - forward(): Computes observation delta from obs.state[t-N] and obs.state[t]
 - select_action(): Converts predicted relative actions back to absolute
 - Uses queue-based observation history tracking (following lerobot conventions)
+
+Supports precomputed relative stats from meta/relative_stats.json (created by
+preprocess_dataset.py) to skip the ~2min stats computation at training init.
 """
 
+import json
 import logging
+from pathlib import Path
 import math
 from collections import deque
 from collections.abc import Callable
@@ -133,9 +138,7 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         self.model = ACTRelativeRTC(config)
 
         if config.temporal_ensemble_coeff is not None:
-            self.temporal_ensembler = ACTTemporalEnsembler(
-                config.temporal_ensemble_coeff, config.chunk_size
-            )
+            self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
         # Normalizers for relative values (delta_obs and relative_actions)
         # These are proper nn.Modules with persistent buffers that serialize correctly.
@@ -148,7 +151,7 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
 
         self.reset()
 
-        # Compute relative stats from dataset if provided and not already configured.
+        # Load or compute relative stats from dataset if provided and not already configured.
         # This happens when training from scratch with lerobot-train.
         # When loading from pretrained (e.g., lerobot-record for evaluation), stats are
         # loaded from the checkpoint AFTER __init__, so we skip computing here.
@@ -160,7 +163,71 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
             and self.config.pretrained_path is None
             and not self.config.skip_compute_relative_stats
         ):
-            self._compute_and_set_relative_stats(dataset_meta)
+            # Try to load precomputed stats from meta/relative_stats.json first
+            if not self._try_load_precomputed_relative_stats(dataset_meta):
+                # Fall back to computing stats from the dataset
+                self._compute_and_set_relative_stats(dataset_meta)
+
+    def _try_load_precomputed_relative_stats(self, dataset_meta) -> bool:
+        """Try to load precomputed relative stats from meta/relative_stats.json.
+
+        Precomputed stats can be created using preprocess_dataset.py, which
+        eliminates the ~2min stats computation at every training init.
+
+        Args:
+            dataset_meta: LeRobotDatasetMetadata with root path.
+
+        Returns:
+            True if precomputed stats were found and loaded, False otherwise.
+        """
+        path_relative_stats = Path(dataset_meta.root) / "meta" / "relative_stats.json"
+
+        if not path_relative_stats.exists():
+            return False
+
+        logging.info(f"Loading precomputed relative stats from {path_relative_stats}")
+
+        with open(path_relative_stats) as f:
+            stats_json = json.load(f)
+
+        # Validate config compatibility
+        config_stored = stats_json.get("config", {})
+        obs_delta_frames_stored = config_stored.get("obs_state_delta_frames")
+        chunk_size_stored = config_stored.get("chunk_size")
+
+        if obs_delta_frames_stored is not None:
+            if obs_delta_frames_stored != self.config.obs_state_delta_frames:
+                logging.warning(
+                    f"Precomputed stats obs_state_delta_frames ({obs_delta_frames_stored}) "
+                    f"differs from config ({self.config.obs_state_delta_frames}). "
+                    "Falling back to computing stats."
+                )
+                return False
+
+        if chunk_size_stored is not None:
+            if chunk_size_stored != self.config.chunk_size:
+                logging.warning(
+                    f"Precomputed stats chunk_size ({chunk_size_stored}) "
+                    f"differs from config ({self.config.chunk_size}). "
+                    "Falling back to computing stats."
+                )
+                return False
+
+        # Convert lists to numpy arrays and set stats
+        stats = {
+            "delta_obs": {
+                "mean": np.array(stats_json["delta_obs"]["mean"], dtype=np.float32),
+                "std": np.array(stats_json["delta_obs"]["std"], dtype=np.float32),
+            },
+            "relative_action": {
+                "mean": np.array(stats_json["relative_action"]["mean"], dtype=np.float32),
+                "std": np.array(stats_json["relative_action"]["std"], dtype=np.float32),
+            },
+        }
+
+        self.set_relative_stats(stats)
+        logging.info("Precomputed relative stats loaded successfully.")
+        return True
 
     def _compute_and_set_relative_stats(self, dataset_meta) -> None:
         """Compute relative stats from dataset metadata and configure normalizers.
@@ -177,9 +244,7 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         """
         from .relative_stats import compute_relative_stats
 
-        logging.info(
-            "Computing relative stats from dataset (one-time initialization)..."
-        )
+        logging.info("Computing relative stats from dataset (one-time initialization)...")
 
         # Recreate the dataset with appropriate delta_timestamps
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -188,19 +253,13 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         delta_timestamps = {}
         for key in dataset_meta.features:
             if key == ACTION:
-                delta_timestamps[key] = [
-                    i / dataset_meta.fps for i in self.config.action_delta_indices
-                ]
+                delta_timestamps[key] = [i / dataset_meta.fps for i in self.config.action_delta_indices]
             elif key == OBS_STATE:
-                delta_timestamps[key] = [
-                    i / dataset_meta.fps for i in self.config.state_delta_indices
-                ]
+                delta_timestamps[key] = [i / dataset_meta.fps for i in self.config.state_delta_indices]
             elif key.startswith("observation."):
                 # For images and other observations, use state_delta_indices
                 # (lerobot applies same indices to all observations)
-                delta_timestamps[key] = [
-                    i / dataset_meta.fps for i in self.config.state_delta_indices
-                ]
+                delta_timestamps[key] = [i / dataset_meta.fps for i in self.config.state_delta_indices]
 
         dataset = LeRobotDataset(
             dataset_meta.repo_id,
@@ -229,18 +288,12 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         return [
             {
                 "params": [
-                    p
-                    for n, p in self.named_parameters()
-                    if not n.startswith("model.backbone") and p.requires_grad
+                    p for n, p in self.named_parameters() if not n.startswith("model.backbone") and p.requires_grad
                 ],
                 "lr": self.config.optimizer_lr,
             },
             {
-                "params": [
-                    p
-                    for n, p in self.named_parameters()
-                    if n.startswith("model.backbone") and p.requires_grad
-                ],
+                "params": [p for n, p in self.named_parameters() if n.startswith("model.backbone") and p.requires_grad],
                 "lr": self.config.optimizer_lr_backbone,
             },
         ]
@@ -248,10 +301,7 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
     @property
     def has_relative_stats(self) -> bool:
         """Check if relative stats normalizers have been configured."""
-        return (
-            self.delta_obs_normalizer.is_configured
-            and self.relative_action_normalizer.is_configured
-        )
+        return self.delta_obs_normalizer.is_configured and self.relative_action_normalizer.is_configured
 
     def set_relative_stats(self, stats: dict) -> None:
         """Configure normalizers with computed statistics.
@@ -298,11 +348,13 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         (single observation, not the stacked pair from training).
         We maintain observation history using queues (following lerobot conventions).
 
-        Normalization is applied if relative stats were provided via set_relative_stats().
+        Requires relative stats to be configured (via checkpoint or call to set_relative_stats()).
         """
         if self.config.use_rtc:
-            raise ValueError(
-                "select_action is not supported for act_relative_rtc policies with use_rtc"
+            raise ValueError("select_action is not supported for act_relative_rtc policies with use_rtc")
+        if not self.has_relative_stats:
+            raise RuntimeError(
+                "select_action() requires relative stats. Load from checkpoint or call set_relative_stats()."
             )
         self.eval()
 
@@ -333,9 +385,7 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
             relative_actions_normalized = self.predict_action_chunk(inference_batch)
             # Unnormalize if stats are available
             if self.has_relative_stats:
-                relative_actions = self.relative_action_normalizer.inverse(
-                    relative_actions_normalized
-                )
+                relative_actions = self.relative_action_normalizer.inverse(relative_actions_normalized)
             else:
                 relative_actions = relative_actions_normalized
             # Convert to absolute
@@ -344,14 +394,12 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         else:
             if len(self._action_queue) == 0:
                 # Predict (normalized) relative actions
-                relative_actions_normalized = self.predict_action_chunk(
-                    inference_batch
-                )[:, : self.config.n_action_steps]
+                relative_actions_normalized = self.predict_action_chunk(inference_batch)[
+                    :, : self.config.n_action_steps
+                ]
                 # Unnormalize if stats are available
                 if self.has_relative_stats:
-                    relative_actions = self.relative_action_normalizer.inverse(
-                        relative_actions_normalized
-                    )
+                    relative_actions = self.relative_action_normalizer.inverse(relative_actions_normalized)
                 else:
                     relative_actions = relative_actions_normalized
                 # Convert to absolute
@@ -372,9 +420,12 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
 
         Args:
             batch: Dictionary containing observations including OBS_STATE with delta observation
+                (normalized if has_relative_stats).
             delay: Number of action prefix steps to condition on (RTC). If action_prefix is
                 provided, its second dimension must equal delay.
-            action_prefix: Absolute action prefix from previous chunk, shape [batch, delay, action_dim]
+            action_prefix: Relative action prefix, shape [batch, delay, action_dim].
+                Must be normalized if has_relative_stats. The caller is responsible for
+                converting absolute actions to relative and normalizing.
 
         Returns:
             Predicted relative actions (normalized if has_relative_stats)
@@ -389,29 +440,20 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
 
         if action_prefix is not None and delay > 0:
             assert action_prefix.shape[1] == delay
-            obs_state_t = batch[OBS_STATE]
             batch_size = batch[OBS_STATE].shape[0]
-            action_prefix_relative = action_prefix - obs_state_t.unsqueeze(1)
-            if self.has_relative_stats:
-                action_prefix_relative = self.relative_action_normalizer(
-                    action_prefix_relative
-                )
-            action_prefix_relative_padded = torch.zeros(
+            # Pad action_prefix to rtc_max_delay (action_prefix is already relative/normalized)
+            action_prefix_padded = torch.zeros(
                 (batch_size, self.config.rtc_max_delay, action_prefix.shape[2]),
-                dtype=action_prefix_relative.dtype,
-                device=action_prefix_relative.device,
+                dtype=action_prefix.dtype,
+                device=action_prefix.device,
             )
-            action_prefix_relative_padded[:, :delay] = action_prefix_relative
-            delays = torch.full(
-                (batch_size,), delay, dtype=torch.long, device=batch[OBS_STATE].device
-            )
+            action_prefix_padded[:, :delay] = action_prefix
+            delays = torch.full((batch_size,), delay, dtype=torch.long, device=batch[OBS_STATE].device)
         else:
-            action_prefix_relative_padded = None
+            action_prefix_padded = None
             delays = None
 
-        actions = self.model(
-            batch, action_prefix=action_prefix_relative_padded, delays=delays
-        )[0]
+        actions = self.model(batch, action_prefix=action_prefix_padded, delays=delays)[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
@@ -460,25 +502,17 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
             # 2 frames (observation_delta_indices applies to all observations).
             # We only use the last frame (index 1 = current frame).
             training_batch[OBS_IMAGES] = [
-                batch[key][:, -1] if batch[key].dim() == 5 else batch[key]
-                for key in self.config.image_features
+                batch[key][:, -1] if batch[key].dim() == 5 else batch[key] for key in self.config.image_features
             ]
 
         if self.config.use_rtc and self.training:
             batch_size = relative_actions.shape[0]
             max_delay = self.config.rtc_max_delay
 
-            delays = torch.randint(
-                0, max_delay + 1, (batch_size,), device=relative_actions.device
-            )
+            delays = torch.randint(0, max_delay + 1, (batch_size,), device=relative_actions.device)
 
-            mask = (
-                torch.arange(max_delay, device=relative_actions.device)
-                < delays[:, None]
-            )
-            action_prefix_relative_padded = relative_actions[
-                :, :max_delay
-            ] * mask.unsqueeze(-1)
+            delays_mask = torch.arange(max_delay, device=relative_actions.device) < delays[:, None]
+            action_prefix_relative_padded = relative_actions[:, :max_delay] * delays_mask.unsqueeze(-1)
 
             pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(
                 training_batch,
@@ -486,25 +520,24 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
                 delays=delays,
             )
 
-            timesteps = torch.arange(
-                self.config.chunk_size, device=relative_actions.device
-            )
-            loss_mask = timesteps[None, :] >= delays[:, None]
-            loss_mask = loss_mask.unsqueeze(-1)
+            timesteps = torch.arange(self.config.chunk_size, device=relative_actions.device)
+            loss_mask = timesteps[None, :] >= delays[:, None]  # [batch, chunk_size]
+            loss_mask = loss_mask.unsqueeze(-1)  # [batch, chunk_size, 1]
 
-            l1_loss_full = (
-                F.l1_loss(relative_actions, pred_relative_actions, reduction="none")
-                * ~batch["action_is_pad"].unsqueeze(-1)
-                * loss_mask
-            )
-            per_sample_loss = l1_loss_full.sum(dim=(1, 2)) / (
-                loss_mask.sum(dim=1) + 1e-8
-            )
+            # Combine masks: valid where not padded AND in postfix (timestep >= delay)
+            valid_mask = (~batch["action_is_pad"].unsqueeze(-1)) & loss_mask
+
+            l1_loss_full = F.l1_loss(relative_actions, pred_relative_actions, reduction="none") * valid_mask
+
+            # Per-sample normalization:
+            # - Normalize by loss_mask (not valid_mask) so samples with different delays contribute equally
+            # - Padded samples (action_is_pad=True) contribute less, consistent with non-RTC path
+            action_dim = relative_actions.shape[-1]
+            num_elements_postfix = loss_mask.sum(dim=(1, 2)) * action_dim  # [batch]
+            per_sample_loss = l1_loss_full.sum(dim=(1, 2)) / (num_elements_postfix + 1e-8)
             l1_loss = per_sample_loss.mean()
         else:
-            pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(
-                training_batch
-            )
+            pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(training_batch)
 
             l1_loss = (
                 F.l1_loss(relative_actions, pred_relative_actions, reduction="none")
@@ -513,14 +546,7 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
 
         loss_dict = {"l1_loss": l1_loss.item()}
         if self.config.use_vae:
-            mean_kld = (
-                (
-                    -0.5
-                    * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())
-                )
-                .sum(-1)
-                .mean()
-            )
+            mean_kld = (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             loss_dict["kld_loss"] = mean_kld.item()
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
@@ -534,9 +560,7 @@ class ACTTemporalEnsembler:
 
     def __init__(self, temporal_ensemble_coeff: float, chunk_size: int) -> None:
         self.chunk_size = chunk_size
-        self.ensemble_weights = torch.exp(
-            -temporal_ensemble_coeff * torch.arange(chunk_size)
-        )
+        self.ensemble_weights = torch.exp(-temporal_ensemble_coeff * torch.arange(chunk_size))
         self.ensemble_weights_cumsum = torch.cumsum(self.ensemble_weights, dim=0)
         self.reset()
 
@@ -546,9 +570,7 @@ class ACTTemporalEnsembler:
 
     def update(self, actions: Tensor) -> Tensor:
         self.ensemble_weights = self.ensemble_weights.to(device=actions.device)
-        self.ensemble_weights_cumsum = self.ensemble_weights_cumsum.to(
-            device=actions.device
-        )
+        self.ensemble_weights_cumsum = self.ensemble_weights_cumsum.to(device=actions.device)
         if self.ensembled_actions is None:
             self.ensembled_actions = actions.clone()
             self.ensembled_actions_count = torch.ones(
@@ -557,21 +579,11 @@ class ACTTemporalEnsembler:
                 device=self.ensembled_actions.device,
             )
         else:
-            self.ensembled_actions *= self.ensemble_weights_cumsum[
-                self.ensembled_actions_count - 1
-            ]
-            self.ensembled_actions += (
-                actions[:, :-1] * self.ensemble_weights[self.ensembled_actions_count]
-            )
-            self.ensembled_actions /= self.ensemble_weights_cumsum[
-                self.ensembled_actions_count
-            ]
-            self.ensembled_actions_count = torch.clamp(
-                self.ensembled_actions_count + 1, max=self.chunk_size
-            )
-            self.ensembled_actions = torch.cat(
-                [self.ensembled_actions, actions[:, -1:]], dim=1
-            )
+            self.ensembled_actions *= self.ensemble_weights_cumsum[self.ensembled_actions_count - 1]
+            self.ensembled_actions += actions[:, :-1] * self.ensemble_weights[self.ensembled_actions_count]
+            self.ensembled_actions /= self.ensemble_weights_cumsum[self.ensembled_actions_count]
+            self.ensembled_actions_count = torch.clamp(self.ensembled_actions_count + 1, max=self.chunk_size)
+            self.ensembled_actions = torch.cat([self.ensembled_actions, actions[:, -1:]], dim=1)
             self.ensembled_actions_count = torch.cat(
                 [
                     self.ensembled_actions_count,
@@ -609,17 +621,13 @@ class ACTRelativeRTC(nn.Module):
                 self.config.action_feature.shape[0],
                 config.dim_model,
             )
-            self.vae_encoder_latent_output_proj = nn.Linear(
-                config.dim_model, config.latent_dim * 2
-            )
+            self.vae_encoder_latent_output_proj = nn.Linear(config.dim_model, config.latent_dim * 2)
             num_input_token_encoder = 1 + config.chunk_size
             if self.config.robot_state_feature:
                 num_input_token_encoder += 1
             self.register_buffer(
                 "vae_encoder_pos_enc",
-                create_sinusoidal_pos_embedding(
-                    num_input_token_encoder, config.dim_model
-                ).unsqueeze(0),
+                create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
             )
 
         if self.config.image_features:
@@ -632,26 +640,18 @@ class ACTRelativeRTC(nn.Module):
                 weights=config.pretrained_backbone_weights,
                 norm_layer=FrozenBatchNorm2d,
             )
-            self.backbone = IntermediateLayerGetter(
-                backbone_model, return_layers={"layer4": "feature_map"}
-            )
+            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
 
         self.encoder = ACTEncoder(config)
         self.decoder = ACTDecoder(config)
 
         if self.config.robot_state_feature:
-            self.encoder_robot_state_input_proj = nn.Linear(
-                self.config.robot_state_feature.shape[0], config.dim_model
-            )
+            self.encoder_robot_state_input_proj = nn.Linear(self.config.robot_state_feature.shape[0], config.dim_model)
         if self.config.env_state_feature:
-            self.encoder_env_state_input_proj = nn.Linear(
-                self.config.env_state_feature.shape[0], config.dim_model
-            )
+            self.encoder_env_state_input_proj = nn.Linear(self.config.env_state_feature.shape[0], config.dim_model)
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
-            self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
-            )
+            self.encoder_img_feat_input_proj = nn.Conv2d(backbone_model.fc.in_features, config.dim_model, kernel_size=1)
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
             n_1d_tokens += 1
@@ -659,14 +659,10 @@ class ACTRelativeRTC(nn.Module):
             n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
-            self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(
-                config.dim_model // 2
-            )
+            self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
 
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
-        self.action_head = nn.Linear(
-            config.dim_model, self.config.action_feature.shape[0]
-        )
+        self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
 
         if self.config.use_rtc:
             action_dim = config.action_feature.shape[0]
@@ -704,25 +700,15 @@ class ACTRelativeRTC(nn.Module):
                 are computed in loss (postfix), positions < delays[i] are masked (prefix).
         """
         if self.config.use_vae and self.training:
-            assert ACTION in batch, (
-                "actions must be provided when using the variational objective in training mode."
-            )
+            assert ACTION in batch, "actions must be provided when using the variational objective in training mode."
 
-        batch_size = (
-            batch[OBS_IMAGES][0].shape[0]
-            if OBS_IMAGES in batch
-            else batch[OBS_ENV_STATE].shape[0]
-        )
+        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
 
         if self.config.use_vae and ACTION in batch and self.training:
-            cls_embed = einops.repeat(
-                self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size
-            )
+            cls_embed = einops.repeat(self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size)
             if self.config.robot_state_feature:
                 # Use delta observation for VAE encoder input
-                robot_state_embed = self.vae_encoder_robot_state_input_proj(
-                    batch[OBS_STATE]
-                )
+                robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE])
                 robot_state_embed = robot_state_embed.unsqueeze(1)
             action_embed = self.vae_encoder_action_input_proj(batch[ACTION])
 
@@ -739,9 +725,7 @@ class ACTRelativeRTC(nn.Module):
                 False,
                 device=batch[OBS_STATE].device,
             )
-            key_padding_mask = torch.cat(
-                [cls_joint_is_pad, batch["action_is_pad"]], axis=1
-            )
+            key_padding_mask = torch.cat([cls_joint_is_pad, batch["action_is_pad"]], axis=1)
 
             cls_token_out = self.vae_encoder(
                 vae_encoder_input.permute(1, 0, 2),
@@ -755,31 +739,23 @@ class ACTRelativeRTC(nn.Module):
             latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
         else:
             mu = log_sigma_x2 = None
-            latent_sample = torch.zeros(
-                [batch_size, self.config.latent_dim], dtype=torch.float32
-            ).to(batch[OBS_STATE].device)
+            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
+                batch[OBS_STATE].device
+            )
 
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(
-            self.encoder_1d_feature_pos_embed.weight.unsqueeze(1)
-        )
+        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
 
         # Use delta observation for encoder input
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(
-                self.encoder_robot_state_input_proj(batch[OBS_STATE])
-            )
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
         if self.config.env_state_feature:
-            encoder_in_tokens.append(
-                self.encoder_env_state_input_proj(batch[OBS_ENV_STATE])
-            )
+            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
         if self.config.image_features:
             for img in batch[OBS_IMAGES]:
                 cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(
-                    dtype=cam_features.dtype
-                )
+                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
@@ -791,12 +767,7 @@ class ACTRelativeRTC(nn.Module):
             action_prefix_embed = self.action_prefix_proj(action_prefix)
             batch_size = action_prefix_embed.shape[0]
 
-            mask = (
-                torch.arange(num_prefix_tokens, device=action_prefix_embed.device)[
-                    None, :
-                ]
-                >= delays[:, None]
-            )
+            mask = torch.arange(num_prefix_tokens, device=action_prefix_embed.device)[None, :] >= delays[:, None]
             action_prefix_embed = torch.where(
                 mask.unsqueeze(-1),
                 self.pad_embed[None, None, :].expand_as(action_prefix_embed),
@@ -807,9 +778,7 @@ class ACTRelativeRTC(nn.Module):
             num_positions_offset = len(encoder_in_pos_embed)
             prefix_pos_embed = create_sinusoidal_pos_embedding(
                 num_positions_offset + num_prefix_tokens, self.config.dim_model
-            )[num_positions_offset:].to(
-                device=batch[OBS_STATE].device, dtype=encoder_in_tokens[0].dtype
-            )
+            )[num_positions_offset:].to(device=batch[OBS_STATE].device, dtype=encoder_in_tokens[0].dtype)
             encoder_in_pos_embed.extend(list(prefix_pos_embed.unsqueeze(1)))
 
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
@@ -840,14 +809,8 @@ class ACTEncoder(nn.Module):
     def __init__(self, config: ACTRelativeRTCConfig, is_vae_encoder: bool = False):
         super().__init__()
         self.is_vae_encoder = is_vae_encoder
-        num_layers = (
-            config.n_vae_encoder_layers
-            if self.is_vae_encoder
-            else config.n_encoder_layers
-        )
-        self.layers = nn.ModuleList(
-            [ACTEncoderLayer(config) for _ in range(num_layers)]
-        )
+        num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
+        self.layers = nn.ModuleList([ACTEncoderLayer(config) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
 
     def forward(
@@ -865,9 +828,7 @@ class ACTEncoder(nn.Module):
 class ACTEncoderLayer(nn.Module):
     def __init__(self, config: ACTRelativeRTCConfig):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            config.dim_model, config.n_heads, dropout=config.dropout
-        )
+        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
         self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
         self.dropout = nn.Dropout(config.dropout)
         self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
@@ -878,9 +839,7 @@ class ACTEncoderLayer(nn.Module):
         self.activation = get_activation_fn(config.feedforward_activation)
         self.pre_norm = config.pre_norm
 
-    def forward(
-        self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None
-    ) -> Tensor:
+    def forward(self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None) -> Tensor:
         skip = x
         if self.pre_norm:
             x = self.norm1(x)
@@ -904,9 +863,7 @@ class ACTEncoderLayer(nn.Module):
 class ACTDecoder(nn.Module):
     def __init__(self, config: ACTRelativeRTCConfig):
         super().__init__()
-        self.layers = nn.ModuleList(
-            [ACTDecoderLayer(config) for _ in range(config.n_decoder_layers)]
-        )
+        self.layers = nn.ModuleList([ACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
         self.norm = nn.LayerNorm(config.dim_model)
 
     def forward(
@@ -931,12 +888,8 @@ class ACTDecoder(nn.Module):
 class ACTDecoderLayer(nn.Module):
     def __init__(self, config: ACTRelativeRTCConfig):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            config.dim_model, config.n_heads, dropout=config.dropout
-        )
-        self.multihead_attn = nn.MultiheadAttention(
-            config.dim_model, config.n_heads, dropout=config.dropout
-        )
+        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+        self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
         self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
         self.dropout = nn.Dropout(config.dropout)
         self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
@@ -994,14 +947,9 @@ def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tenso
     """1D sinusoidal positional embeddings as in Attention is All You Need."""
 
     def get_position_angle_vec(position):
-        return [
-            position / np.power(10000, 2 * (hid_j // 2) / dimension)
-            for hid_j in range(dimension)
-        ]
+        return [position / np.power(10000, 2 * (hid_j // 2) / dimension) for hid_j in range(dimension)]
 
-    sinusoid_table = np.array(
-        [get_position_angle_vec(pos_i) for pos_i in range(num_positions)]
-    )
+    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(num_positions)])
     sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])
     sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])
     return torch.from_numpy(sinusoid_table).float()
@@ -1024,18 +972,12 @@ class ACTSinusoidalPositionEmbedding2d(nn.Module):
         y_range = y_range / (y_range[:, -1:, :] + self._eps) * self._two_pi
         x_range = x_range / (x_range[:, :, -1:] + self._eps) * self._two_pi
         inverse_frequency = self._temperature ** (
-            2
-            * (torch.arange(self.dimension, dtype=torch.float32, device=x.device) // 2)
-            / self.dimension
+            2 * (torch.arange(self.dimension, dtype=torch.float32, device=x.device) // 2) / self.dimension
         )
         x_range = x_range.unsqueeze(-1) / inverse_frequency
         y_range = y_range.unsqueeze(-1) / inverse_frequency
-        pos_embed_x = torch.stack(
-            (x_range[..., 0::2].sin(), x_range[..., 1::2].cos()), dim=-1
-        ).flatten(3)
-        pos_embed_y = torch.stack(
-            (y_range[..., 0::2].sin(), y_range[..., 1::2].cos()), dim=-1
-        ).flatten(3)
+        pos_embed_x = torch.stack((x_range[..., 0::2].sin(), x_range[..., 1::2].cos()), dim=-1).flatten(3)
+        pos_embed_y = torch.stack((y_range[..., 0::2].sin(), y_range[..., 1::2].cos()), dim=-1).flatten(3)
         pos_embed = torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)
         return pos_embed
 

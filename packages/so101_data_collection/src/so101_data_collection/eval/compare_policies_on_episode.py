@@ -212,11 +212,20 @@ def predict_chunk_relative(
         if rtc_delay > 0 and policy.config.use_rtc:
             gt_actions = sample["action"].cpu().numpy()
             prefix_len = min(rtc_delay, len(gt_actions))
-            action_prefix = (
+            # Get absolute action prefix from ground truth
+            action_prefix_abs = (
                 torch.from_numpy(gt_actions[:prefix_len]).unsqueeze(0).to(device)
             )
+            # Convert to relative: action_prefix - state_t
+            state_t_tensor = state_t.unsqueeze(0).to(device)
+            action_prefix_relative = action_prefix_abs - state_t_tensor.unsqueeze(1)
+            # Normalize if has_relative_stats
+            if policy.has_relative_stats:
+                action_prefix_relative = policy.relative_action_normalizer(
+                    action_prefix_relative
+                )
             relative_actions = policy.predict_action_chunk(
-                batch, delay=prefix_len, action_prefix=action_prefix
+                batch, delay=prefix_len, action_prefix=action_prefix_relative
             )
         else:
             relative_actions = policy.predict_action_chunk(batch)

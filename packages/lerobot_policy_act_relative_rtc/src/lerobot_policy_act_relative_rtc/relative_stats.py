@@ -84,25 +84,30 @@ def compute_relative_stats(
         # Compute relative actions (same as model.forward())
         # action shape: [batch, chunk_size, action_dim]
         absolute_actions = batch[ACTION]
-        relative_actions = absolute_actions - obs_state_t.unsqueeze(
-            1
-        )  # [batch, chunk_size, action_dim]
+        relative_actions = absolute_actions - obs_state_t.unsqueeze(1)  # [batch, chunk_size, action_dim]
+
+        # Get action padding mask if available (from LeRobot's delta_timestamps handling)
+        # action_is_pad shape: [batch, chunk_size] - True where action is padded
+        action_is_pad = batch.get(f"{ACTION}_is_pad", None)
 
         # Flatten relative_actions across batch and temporal dimensions
         # This treats all timesteps equally for statistics computation
         batch_size_actual, chunk_size, action_dim = relative_actions.shape
-        relative_actions_flat = relative_actions.reshape(
-            -1, action_dim
-        )  # [batch * chunk_size, action_dim]
+        relative_actions_flat = relative_actions.reshape(-1, action_dim)  # [batch * chunk_size, action_dim]
+
+        # Filter out padded actions if padding mask is available
+        if action_is_pad is not None:
+            action_is_pad_flat = action_is_pad.reshape(-1)  # [batch * chunk_size]
+            # Only keep non-padded actions
+            relative_actions_flat = relative_actions_flat[~action_is_pad_flat]
 
         delta_obs_list.append(delta_obs.numpy())
-        relative_action_list.append(relative_actions_flat.numpy())
+        if len(relative_actions_flat) > 0:
+            relative_action_list.append(relative_actions_flat.numpy())
 
     # Concatenate all batches
     all_delta_obs = np.concatenate(delta_obs_list, axis=0)  # [N, state_dim]
-    all_relative_actions = np.concatenate(
-        relative_action_list, axis=0
-    )  # [N * chunk_size, action_dim]
+    all_relative_actions = np.concatenate(relative_action_list, axis=0)  # [N * chunk_size, action_dim]
 
     # Compute statistics
     delta_obs_stats = {
@@ -114,12 +119,8 @@ def compute_relative_stats(
         "std": np.std(all_relative_actions, axis=0).astype(np.float32),
     }
 
-    logging.info(
-        f"Delta obs stats - mean: {delta_obs_stats['mean']}, std: {delta_obs_stats['std']}"
-    )
-    logging.info(
-        f"Relative action stats - mean: {relative_action_stats['mean']}, std: {relative_action_stats['std']}"
-    )
+    logging.info(f"Delta obs stats - mean: {delta_obs_stats['mean']}, std: {delta_obs_stats['std']}")
+    logging.info(f"Relative action stats - mean: {relative_action_stats['mean']}, std: {relative_action_stats['std']}")
 
     return {
         "delta_obs": delta_obs_stats,

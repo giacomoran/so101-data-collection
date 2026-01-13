@@ -68,6 +68,12 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
     """
 
     downscale_img_square: int | None = None
+    _cached_hw: tuple[int, int] | None = None
+    _cached_scale: float | None = None
+    _cached_resize_hw: tuple[int, int] | None = None
+    _cached_padding: tuple[int, int, int, int] | None = None
+    _cached_ndim: int | None = None
+    _cached_is_mps: bool | None = None
 
     def observation(self, observation: dict) -> dict:
         """
@@ -129,37 +135,54 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
             # Now image is (N, C, H, W) where N >= 1
             N, C, H, W = image.shape
 
-            # Pad to square
-            max_dim = max(H, W)
-            pad_h = max_dim - H
-            pad_w = max_dim - W
-            padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
+            # Early exit: if image is already at target resolution, skip processing
+            # This handles preprocessed datasets where videos are already resized
+            if H == self.downscale_img_square and W == self.downscale_img_square:
+                new_observation[key] = observation[key]
+                continue
+
+            # Cache parameters on first call
+            if self._cached_hw is None:
+                self._cached_hw = (H, W)
+                self._cached_ndim = original_ndim
+                self._cached_is_mps = device.type == "mps"
+
+                # Optimized approach: resize first (preserve aspect ratio), then pad
+                scale = self.downscale_img_square / max(H, W)
+                self._cached_scale = scale
+                new_h = int(H * scale)
+                new_w = int(W * scale)
+                self._cached_resize_hw = (new_h, new_w)
+
+                pad_h = self.downscale_img_square - new_h
+                pad_w = self.downscale_img_square - new_w
+                padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
+                self._cached_padding = padding
 
             # Move to CPU for interpolation if on MPS (MPS has issues with some operations)
-            is_mps = device.type == "mps"
-            if is_mps:
+            if self._cached_is_mps:
                 image = image.cpu()
 
-            # Pad to square
-            image = F.pad(image, padding, fill=0, padding_mode="constant")
-
-            # Resize using interpolate
-            if self.downscale_img_square > 0:
+            # Resize first (preserving aspect ratio) - faster than padding then resizing
+            if self._cached_resize_hw is not None:
                 image = torch.nn.functional.interpolate(
                     image,
-                    size=(self.downscale_img_square, self.downscale_img_square),
-                    mode="area",
+                    size=self._cached_resize_hw,
+                    mode="bilinear",
+                    align_corners=False,
                 )
+
+            # Pad to square
+            if self._cached_padding is not None:
+                image = F.pad(image, self._cached_padding, fill=0, padding_mode="constant")
 
             # Restore original shape if needed (only for 5D case)
             if restore_5d:
                 # Restore (B, T, C, H, W) from (B*T, C, H, W)
-                image = image.view(
-                    original_B, original_T, C, image.shape[-2], image.shape[-1]
-                )
+                image = image.view(original_B, original_T, C, image.shape[-2], image.shape[-1])
 
             # Move back to original device
-            if is_mps:
+            if self._cached_is_mps:
                 image = image.to(device)
 
             new_observation[key] = image
@@ -235,9 +258,7 @@ def make_act_relative_rtc_pre_post_processors(
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
-        ImagePadSquareResizeProcessorStep(
-            downscale_img_square=config.downscale_img_square
-        ),
+        ImagePadSquareResizeProcessorStep(downscale_img_square=config.downscale_img_square),
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,

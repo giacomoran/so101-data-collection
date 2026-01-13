@@ -20,8 +20,10 @@
       "Bash(ls *)",
       "Bash(pwd)",
       "Bash(which *)",
-      "Bash(python --version)",
-      "Bash(python3 --version)",
+      "Bash(tree *)",
+      "Bash(source .venv/bin/activate)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
       "Bash(nix develop*)"
     ]
   },
