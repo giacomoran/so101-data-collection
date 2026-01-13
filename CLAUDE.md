@@ -5,7 +5,13 @@ This file provides guidance for Claude Code working in this repository.
 ## Project Overview
 
 Python 3.10+ monorepo for SO-101 robot arm data collection, training, and evaluation. Uses uv workspace with packages/ structure.
-The extended main plan for this project is in @plans/main.md
+
+**Goal**: Benchmark comparing three teleoperation setups (phone teleop, leader teleop, hand-guided) across three manipulation tasks (cube, gba, ball). See `plans/main.md` for full experimental design.
+
+### Packages
+
+- **so101_data_collection**: Data collection scripts for the benchmark
+- **lerobot_policy_act_relative_rtc**: Custom ACT policy using relative joint representations (observation deltas + relative actions) with optional Real-Time Chunking (RTC) for smoother inference
 
 ## Environment Setup
 
@@ -26,7 +32,7 @@ This project uses the LeRobot library for robotics data collection with the SO10
 
 LeRobot is installed from a **pinned git commit** (not PyPI) because the latest PyPI version (0.4.2) is outdated. See `pyproject.toml` for the exact commit hash.
 
-IMPORTANT: When you need to understand how LeRobot works internally, explore it's source files in
+IMPORTANT: When you need to understand how LeRobot works internally, explore its source files in
 
 ```
 .venv/lib/python3.10/site-packages/lerobot/
@@ -56,10 +62,18 @@ We use the `bak` prefix/suffix for backup files and folders, ignore those unless
 
 Align the caller's variable names with the callee's parameter names to reduce cognitive load and make data flow explicit. The variable names outside a function must match the internal parameters exactly. The exception is when handling generic sequences or iterative data, where indexed suffixes (like `_1, _2, _3`) are used to represent distinct instances of the same conceptual type.
 
+## Code Quality
+
+- **Formatting**: Uses ruff for code formatting (auto-runs via Claude Code hook on file save)
+- **Linting**: Uses ruff for linting
+- **Type Checking**: Disabled (no mypy/pyright/ty)
+
+Run manually if needed:
+```bash
+uv run ruff format .
+uv run ruff check .
+```
+
 ## File Organization
 
 - **Plans**: All project plans should be stored in the `plans/` folder.
-
-## Consistency
-
-Code within a project should be consistent with the rest of the project, even if this means breaking the rules above. Adhere to shared coding standards, style guides, and best practices across the project. Write code that is easy for any team member to read, understand, and modify, ensuring consistent naming conventions, formatting, and patterns. Prioritize clarity over cleverness, and aim for simplicity and predictability.

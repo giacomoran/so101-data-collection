@@ -9,6 +9,9 @@ members = ["packages/*"]
 [dependency-groups]
 dev = ["ruff>=0.14.11"]
 
+[tool.ruff]
+line-length = 120
+
 [tool.ruff.lint]
 ignore = [
     "F541", # f-string without any placeholders
