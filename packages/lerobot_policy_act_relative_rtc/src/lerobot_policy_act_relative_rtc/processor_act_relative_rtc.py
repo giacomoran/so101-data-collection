@@ -50,6 +50,51 @@ from lerobot.utils.constants import (
 from .configuration_act_relative_rtc import ACTRelativeRTCConfig
 
 
+@ProcessorStepRegistry.register("drop_unused_image_frames_processor")
+@dataclass
+class DropUnusedImageFramesProcessorStep(ObservationProcessorStep):
+    """Drops unused image frames loaded due to observation_delta_indices.
+
+    Since observation_delta_indices is applied uniformly to all observation features,
+    images are loaded with shape [B, T, C, H, W] where T=2 (for state deltas), but
+    only the last frame (T=-1) is actually used. This step drops the first frame
+    BEFORE GPU transfer to save bandwidth and memory.
+
+    Attributes:
+        keys_image: List of image keys to process.
+    """
+
+    keys_image: list[str] = field(default_factory=list)
+
+    def observation(self, observation: dict) -> dict:
+        new_observation = dict(observation)
+
+        for key in self.keys_image:
+            if key not in observation:
+                continue
+
+            image = observation[key]
+
+            # If image has temporal dimension [B, T, C, H, W] where T > 1,
+            # keep only the last frame
+            if image.dim() == 5 and image.shape[1] > 1:
+                # Extract last frame: [B, T, C, H, W] -> [B, 1, C, H, W]
+                new_observation[key] = image[:, -1:, :, :, :]
+
+        return new_observation
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "keys_image": self.keys_image,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        # Features remain unchanged as this is just dropping redundant frames
+        return features
+
+
 @ProcessorStepRegistry.register("image_pad_square_resize_processor")
 @dataclass
 class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
@@ -197,12 +242,22 @@ def make_act_relative_rtc_pre_post_processors(
         ),
     ]
 
+    # Drop unused image frames BEFORE GPU transfer (if there are image features).
+    # This saves CPU-GPU bandwidth by avoiding transfer of the unused first frame.
+    if config.image_features:
+        input_steps.insert(
+            2,  # Before DeviceProcessorStep
+            DropUnusedImageFramesProcessorStep(
+                keys_image=[key for key in config.image_features],
+            ),
+        )
+
     # Only add image resize step if images actually need resizing.
     # Skip if: downscale_img_square is None, or images are already at target resolution.
     keys_image = _get_keys_image_needing_resize(config)
     if keys_image:
         input_steps.insert(
-            3,  # After DeviceProcessorStep
+            4,  # After DeviceProcessorStep (adjusted index due to drop step above)
             ImagePadSquareResizeProcessorStep(
                 target_resolution=config.downscale_img_square,
                 keys_image=keys_image,

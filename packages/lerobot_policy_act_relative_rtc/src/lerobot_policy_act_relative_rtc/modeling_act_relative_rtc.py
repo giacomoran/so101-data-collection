@@ -496,11 +496,10 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         training_batch[OBS_STATE] = delta_obs_state
 
         if self.config.image_features:
-            # Images have shape [batch, 2, channels, height, width] due to lerobot loading
-            # 2 frames (observation_delta_indices applies to all observations).
-            # We only use the last frame (index 1 = current frame).
+            # Images now have shape [batch, 1, channels, height, width] after DropUnusedImageFramesProcessorStep
+            # removes the unused first frame. We squeeze out the temporal dimension.
             training_batch[OBS_IMAGES] = [
-                batch[key][:, -1] if batch[key].dim() == 5 else batch[key] for key in self.config.image_features
+                batch[key].squeeze(1) if batch[key].dim() == 5 else batch[key] for key in self.config.image_features
             ]
 
         if self.config.use_rtc and self.training:
