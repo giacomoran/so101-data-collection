@@ -52,11 +52,6 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 from .configuration_act_relative_rtc import ACTRelativeRTCConfig
 
-try:
-    import wandb
-except ImportError:
-    wandb = None
-
 
 class Normalizer(nn.Module):
     """Affine normalization module with persistent mean/std buffers.
@@ -553,6 +548,8 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
 
         # Add RTC-specific metrics to loss_dict
         if self.config.use_rtc and self.training:
+            # Track average delay for RTC training
+            loss_dict["rtc_avg_delay"] = delays.float().mean().item()
             if l1_loss_prefix is not None:
                 loss_dict["l1_loss_prefix"] = l1_loss_prefix.item()
             if l1_loss_postfix is not None:
@@ -565,23 +562,9 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         else:
             loss = l1_loss
 
-        # Log custom metrics to wandb (LeRobot initializes wandb before training)
-        if self.training and wandb is not None and wandb.run is not None:
-            log_dict = {"train/l1_loss": loss_dict["l1_loss"]}
-
-            if self.config.use_rtc:
-                # Log RTC-specific metrics
-                log_dict["train/rtc_avg_delay"] = delays.float().mean().item()
-                if l1_loss_prefix is not None:
-                    log_dict["train/l1_loss_prefix"] = l1_loss_prefix.item()
-                if l1_loss_postfix is not None:
-                    log_dict["train/l1_loss_postfix"] = l1_loss_postfix.item()
-
-            if self.config.use_vae:
-                log_dict["train/kld_loss"] = loss_dict["kld_loss"]
-
-            wandb.log(log_dict)
-
+        # LeRobot's training loop automatically logs loss_dict metrics to wandb
+        # at intervals controlled by log_freq. Metrics are aggregated using
+        # AverageMeter and automatically prefixed with "train/".
         return loss, loss_dict
 
 
