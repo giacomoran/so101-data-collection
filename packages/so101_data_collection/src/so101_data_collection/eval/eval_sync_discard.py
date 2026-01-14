@@ -101,9 +101,7 @@ class EvalDiscardConfig:
         policy_path = parser.get_path_arg("policy")
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
-            self.policy = PreTrainedConfig.from_pretrained(
-                policy_path, cli_overrides=cli_overrides
-            )
+            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
 
         if self.policy is None:
@@ -216,14 +214,10 @@ def run_inference_chunk(
 
     with (
         torch.inference_mode(),
-        torch.autocast(device_type=device.type)
-        if device.type == "cuda" and use_amp
-        else nullcontext(),
+        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
     ):
         # Step 1 & 2: Convert to tensors and apply preprocessor
-        observation = prepare_observation_for_inference(
-            observation_frame, device, task, robot_type
-        )
+        observation = prepare_observation_for_inference(observation_frame, device, task, robot_type)
         observation = preprocessor(observation)
 
         # Step 3: Update observation queue and compute delta
@@ -250,9 +244,7 @@ def run_inference_chunk(
 
         # Step 6: Unnormalize relative actions
         if policy.has_relative_stats:
-            relative_actions = policy.relative_action_normalizer.inverse(
-                relative_actions_normalized
-            )
+            relative_actions = policy.relative_action_normalizer.inverse(relative_actions_normalized)
         else:
             relative_actions = relative_actions_normalized
 
@@ -352,25 +344,15 @@ def run_episode_sync_discard(
     ds_features = ds_meta.features
 
     # Get motor names from robot (keys like "shoulder_pan.pos")
-    motor_names = [
-        k for k in robot.observation_features if robot.observation_features[k] is float
-    ]
+    motor_names = [k for k in robot.observation_features if robot.observation_features[k] is float]
 
     # Get camera names from robot (keys like "wrist")
-    camera_names = [
-        k
-        for k in robot.observation_features
-        if isinstance(robot.observation_features[k], tuple)
-    ]
+    camera_names = [k for k in robot.observation_features if isinstance(robot.observation_features[k], tuple)]
 
     # Get policy config values (with optional override)
     policy_n_action_steps = getattr(policy.config, "n_action_steps", 1)
-    n_action_steps = (
-        cfg.n_action_steps if cfg.n_action_steps is not None else policy_n_action_steps
-    )
-    logging.info(
-        f"Policy n_action_steps: {policy_n_action_steps}, using: {n_action_steps}"
-    )
+    n_action_steps = cfg.n_action_steps if cfg.n_action_steps is not None else policy_n_action_steps
+    logging.info(f"Policy n_action_steps: {policy_n_action_steps}, using: {n_action_steps}")
     logging.info(f"Policy obs_state_delta_frames: {obs_state_delta_frames}")
     logging.info(f"Policy has_relative_stats: {policy.has_relative_stats}")
 
@@ -402,9 +384,7 @@ def run_episode_sync_discard(
 
         # observation.state: array of joint positions
         state_values = [raw_obs[motor_name] for motor_name in motor_names]
-        observation_frame["observation.state"] = np.array(
-            state_values, dtype=np.float32
-        )
+        observation_frame["observation.state"] = np.array(state_values, dtype=np.float32)
 
         # observation.images.X: camera images
         for cam_name in camera_names:
@@ -447,10 +427,7 @@ def run_episode_sync_discard(
         n_actions = actions_to_execute.shape[1]
 
         if chunk_idx % 10 == 0:
-            logging.info(
-                f"Chunk {chunk_idx}: inference={inference_ms:.1f}ms, "
-                f"skip={n_skip}, execute={n_actions}"
-            )
+            logging.info(f"Chunk {chunk_idx}: inference={inference_ms:.1f}ms, skip={n_skip}, execute={n_actions}")
 
         # === EXECUTION PHASE ===
         # Execute remaining actions at target fps
@@ -495,12 +472,10 @@ def run_episode_sync_discard(
             # Here we need to manually update the queue after each action to maintain the same behavior.
             # Get fresh observation after action execution
             raw_obs_after = robot.get_observation()
-            state_values_after = [
-                raw_obs_after[motor_name] for motor_name in motor_names
-            ]
-            obs_state_after = torch.tensor(
-                np.array(state_values_after, dtype=np.float32), device=device
-            ).unsqueeze(0)  # Add batch dimension [1, state_dim]
+            state_values_after = [raw_obs_after[motor_name] for motor_name in motor_names]
+            obs_state_after = torch.tensor(np.array(state_values_after, dtype=np.float32), device=device).unsqueeze(
+                0
+            )  # Add batch dimension [1, state_dim]
             obs_queue.update(obs_state_after)
 
             # Sleep to maintain target fps
@@ -536,8 +511,7 @@ def run_episode_sync_discard(
 
     if discard_stats:
         logging.info(
-            f"Discarded actions: total={discard_stats['total_discarded']}, "
-            f"mean={discard_stats['mean']:.1f}/chunk"
+            f"Discarded actions: total={discard_stats['total_discarded']}, mean={discard_stats['mean']:.1f}/chunk"
         )
 
 

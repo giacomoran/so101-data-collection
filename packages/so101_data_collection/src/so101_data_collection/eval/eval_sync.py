@@ -144,9 +144,7 @@ class EvalConfig:
         policy_path = parser.get_path_arg("policy")
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
-            self.policy = PreTrainedConfig.from_pretrained(
-                policy_path, cli_overrides=cli_overrides
-            )
+            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
             self.policy.pretrained_path = policy_path
 
         if self.policy is None:
@@ -259,14 +257,10 @@ def run_inference_chunk(
 
     with (
         torch.inference_mode(),
-        torch.autocast(device_type=device.type)
-        if device.type == "cuda" and use_amp
-        else nullcontext(),
+        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
     ):
         # Step 1 & 2: Convert to tensors and apply preprocessor
-        observation = prepare_observation_for_inference(
-            observation_frame, device, task, robot_type
-        )
+        observation = prepare_observation_for_inference(observation_frame, device, task, robot_type)
         observation = preprocessor(observation)
 
         # Step 3: Update observation queue and compute delta
@@ -293,9 +287,7 @@ def run_inference_chunk(
 
         # Step 6: Unnormalize relative actions
         if policy.has_relative_stats:
-            relative_actions = policy.relative_action_normalizer.inverse(
-                relative_actions_normalized
-            )
+            relative_actions = policy.relative_action_normalizer.inverse(relative_actions_normalized)
         else:
             relative_actions = relative_actions_normalized
 
@@ -352,25 +344,15 @@ def run_episode_sync(
     ds_features = ds_meta.features
 
     # Get motor names from robot (keys like "shoulder_pan.pos")
-    motor_names = [
-        k for k in robot.observation_features if robot.observation_features[k] is float
-    ]
+    motor_names = [k for k in robot.observation_features if robot.observation_features[k] is float]
 
     # Get camera names from robot (keys like "wrist")
-    camera_names = [
-        k
-        for k in robot.observation_features
-        if isinstance(robot.observation_features[k], tuple)
-    ]
+    camera_names = [k for k in robot.observation_features if isinstance(robot.observation_features[k], tuple)]
 
     # Get policy config values (with optional override)
     policy_n_action_steps = getattr(policy.config, "n_action_steps", 1)
-    n_action_steps = (
-        cfg.n_action_steps if cfg.n_action_steps is not None else policy_n_action_steps
-    )
-    logging.info(
-        f"Policy n_action_steps: {policy_n_action_steps}, using: {n_action_steps}"
-    )
+    n_action_steps = cfg.n_action_steps if cfg.n_action_steps is not None else policy_n_action_steps
+    logging.info(f"Policy n_action_steps: {policy_n_action_steps}, using: {n_action_steps}")
     logging.info(f"Policy obs_state_delta_frames: {obs_state_delta_frames}")
     logging.info(f"Policy has_relative_stats: {policy.has_relative_stats}")
 
@@ -401,9 +383,7 @@ def run_episode_sync(
 
         # observation.state: array of joint positions
         state_values = [raw_obs[motor_name] for motor_name in motor_names]
-        observation_frame["observation.state"] = np.array(
-            state_values, dtype=np.float32
-        )
+        observation_frame["observation.state"] = np.array(state_values, dtype=np.float32)
 
         # observation.images.X: camera images
         for cam_name in camera_names:
@@ -426,10 +406,7 @@ def run_episode_sync(
         latency_tracker.record(inference_ms, log_to_rerun=cfg.display_data)
 
         if chunk_idx % 10 == 0:
-            logging.info(
-                f"Chunk {chunk_idx}: inference={inference_ms:.1f}ms, "
-                f"executing {n_action_steps} actions"
-            )
+            logging.info(f"Chunk {chunk_idx}: inference={inference_ms:.1f}ms, executing {n_action_steps} actions")
 
         # === EXECUTION PHASE ===
         # Execute all actions in the chunk at target fps
@@ -462,13 +439,9 @@ def run_episode_sync(
                 raw_obs = robot.get_observation()
                 observation_frame = {}
                 state_values = [raw_obs[motor_name] for motor_name in motor_names]
-                observation_frame["observation.state"] = np.array(
-                    state_values, dtype=np.float32
-                )
+                observation_frame["observation.state"] = np.array(state_values, dtype=np.float32)
                 for cam_name in camera_names:
-                    observation_frame[f"observation.images.{cam_name}"] = raw_obs[
-                        cam_name
-                    ]
+                    observation_frame[f"observation.images.{cam_name}"] = raw_obs[cam_name]
                 log_rerun_data(observation=observation_frame, action=robot_action)
 
             # Send action to robot
@@ -482,12 +455,10 @@ def run_episode_sync(
             # Here we need to manually update the queue after each action to maintain the same behavior.
             # Get fresh observation after action execution
             raw_obs_after = robot.get_observation()
-            state_values_after = [
-                raw_obs_after[motor_name] for motor_name in motor_names
-            ]
-            obs_state_after = torch.tensor(
-                np.array(state_values_after, dtype=np.float32), device=device
-            ).unsqueeze(0)  # Add batch dimension [1, state_dim]
+            state_values_after = [raw_obs_after[motor_name] for motor_name in motor_names]
+            obs_state_after = torch.tensor(np.array(state_values_after, dtype=np.float32), device=device).unsqueeze(
+                0
+            )  # Add batch dimension [1, state_dim]
             obs_queue.update(obs_state_after)
 
             # Sleep to maintain target fps
@@ -501,10 +472,7 @@ def run_episode_sync(
     # Log final stats
     total_time = time.perf_counter() - start_episode_t
     actual_fps = total_actions_executed / total_time if total_time > 0 else 0
-    logging.info(
-        f"Episode complete: {total_actions_executed} actions in {total_time:.1f}s "
-        f"({actual_fps:.1f} fps)"
-    )
+    logging.info(f"Episode complete: {total_actions_executed} actions in {total_time:.1f}s ({actual_fps:.1f} fps)")
 
     # Log latency summary to rerun
     if cfg.display_data:
@@ -514,8 +482,7 @@ def run_episode_sync(
     stats = latency_tracker.get_stats()
     if stats:
         logging.info(
-            f"Inference latency: mean={stats['mean']:.1f}ms, "
-            f"std={stats['std']:.1f}ms, p95={stats['p95']:.1f}ms"
+            f"Inference latency: mean={stats['mean']:.1f}ms, std={stats['std']:.1f}ms, p95={stats['p95']:.1f}ms"
         )
 
 
