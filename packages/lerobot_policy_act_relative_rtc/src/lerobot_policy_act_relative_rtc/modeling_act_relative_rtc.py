@@ -32,11 +32,11 @@ preprocess_dataset.py) to skip the ~2min stats computation at training init.
 
 import json
 import logging
-from pathlib import Path
 import math
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
+from pathlib import Path
 
 import einops
 import numpy as np
@@ -51,6 +51,11 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from .configuration_act_relative_rtc import ACTRelativeRTCConfig
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 class Normalizer(nn.Module):
@@ -518,21 +523,20 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
             )
 
             timesteps = torch.arange(self.config.chunk_size, device=relative_actions.device)
-            loss_mask = timesteps[None, :] >= delays[:, None]  # [batch, chunk_size]
-            loss_mask = loss_mask.unsqueeze(-1)  # [batch, chunk_size, 1]
+            postfix_mask = timesteps[None, :] >= delays[:, None]  # [batch, chunk_size]
+            postfix_mask = postfix_mask.unsqueeze(-1)  # [batch, chunk_size, 1]
+            prefix_mask = ~postfix_mask
 
-            # Combine masks: valid where not padded AND in postfix (timestep >= delay)
-            valid_mask = (~batch["action_is_pad"].unsqueeze(-1)) & loss_mask
+            # Padding mask (always exclude padded actions)
+            pad_mask = ~batch["action_is_pad"].unsqueeze(-1)
 
-            l1_loss_full = F.l1_loss(relative_actions, pred_relative_actions, reduction="none") * valid_mask
+            # Compute L1 loss on all timesteps (both prefix and postfix)
+            l1_loss_full = F.l1_loss(relative_actions, pred_relative_actions, reduction="none")
+            l1_loss = (l1_loss_full * pad_mask).mean()
 
-            # Per-sample normalization:
-            # - Normalize by loss_mask (not valid_mask) so samples with different delays contribute equally
-            # - Padded samples (action_is_pad=True) contribute less, consistent with non-RTC path
-            action_dim = relative_actions.shape[-1]
-            num_elements_postfix = loss_mask.sum(dim=(1, 2)) * action_dim  # [batch]
-            per_sample_loss = l1_loss_full.sum(dim=(1, 2)) / (num_elements_postfix + 1e-8)
-            l1_loss = per_sample_loss.mean()
+            # For logging: separate prefix and postfix losses
+            l1_loss_postfix = (l1_loss_full * pad_mask * postfix_mask).sum() / ((pad_mask * postfix_mask).sum() + 1e-8)
+            l1_loss_prefix = (l1_loss_full * pad_mask * prefix_mask).sum() / ((pad_mask * prefix_mask).sum() + 1e-8)
         else:
             pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(training_batch)
 
@@ -541,13 +545,42 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
                 * ~batch["action_is_pad"].unsqueeze(-1)
             ).mean()
 
+            # For non-RTC, set these to None (won't be logged)
+            l1_loss_prefix = None
+            l1_loss_postfix = None
+
         loss_dict = {"l1_loss": l1_loss.item()}
+
+        # Add RTC-specific metrics to loss_dict
+        if self.config.use_rtc and self.training:
+            if l1_loss_prefix is not None:
+                loss_dict["l1_loss_prefix"] = l1_loss_prefix.item()
+            if l1_loss_postfix is not None:
+                loss_dict["l1_loss_postfix"] = l1_loss_postfix.item()
+
         if self.config.use_vae:
             mean_kld = (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
             loss_dict["kld_loss"] = mean_kld.item()
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
+
+        # Log custom metrics to wandb (LeRobot initializes wandb before training)
+        if self.training and wandb is not None and wandb.run is not None:
+            log_dict = {"train/l1_loss": loss_dict["l1_loss"]}
+
+            if self.config.use_rtc:
+                # Log RTC-specific metrics
+                log_dict["train/rtc_avg_delay"] = delays.float().mean().item()
+                if l1_loss_prefix is not None:
+                    log_dict["train/l1_loss_prefix"] = l1_loss_prefix.item()
+                if l1_loss_postfix is not None:
+                    log_dict["train/l1_loss_postfix"] = l1_loss_postfix.item()
+
+            if self.config.use_vae:
+                log_dict["train/kld_loss"] = loss_dict["kld_loss"]
+
+            wandb.log(log_dict)
 
         return loss, loss_dict
 

@@ -107,14 +107,21 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
     Attributes:
         target_resolution: The target square resolution (e.g., 224 for 224x224).
         keys_image: List of image keys to process.
+        downscale_img_square: (Deprecated) Alias for target_resolution for backward compatibility.
     """
 
     target_resolution: int = 224
     keys_image: list[str] = field(default_factory=list)
+    downscale_img_square: int | None = None  # Backward compatibility
 
     # Cached resize parameters (computed on first call)
     _hw_resize: tuple[int, int] | None = None
     _padding: tuple[int, int, int, int] | None = None
+
+    def __post_init__(self):
+        """Handle backward compatibility with old parameter name."""
+        if self.downscale_img_square is not None:
+            self.target_resolution = self.downscale_img_square
 
     def observation(self, observation: dict) -> dict:
         new_observation = dict(observation)
