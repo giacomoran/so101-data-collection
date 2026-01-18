@@ -460,9 +460,8 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
 
         This method:
         1. Converts absolute actions to normalized relative actions
-        2. Samples per-sample delays from {0, ..., rtc_max_delay}
-        3. Passes full sequence to inner model (which extracts prefix/targets and masks)
-        4. Computes L1 loss on targets only
+        2. Inner model evaluates all delays {0, ..., rtc_max_delay}, returns [B*D, ...] outputs
+        3. Computes L1 loss on targets across all delays
         """
         # Get obs_state_t - squeeze temporal dim if present (observation_delta_indices=[0] adds dim)
         obs_state_t = batch[OBS_STATE]
@@ -470,6 +469,7 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
             obs_state_t = obs_state_t.squeeze(1)  # [batch, state_dim]
         max_delay = self.config.rtc_max_delay
         chunk_size = self.config.chunk_size
+        n_delays = max_delay + 1
 
         # Validate input shapes
         expected_action_len = max_delay + chunk_size
@@ -488,27 +488,29 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         # Normalize relative actions
         relative_actions = self.relative_action_normalizer(relative_actions)
 
-        # Sample per-sample delays from {0, ..., max_delay}
         batch_size = relative_actions.shape[0]
-        delays = torch.randint(0, max_delay + 1, (batch_size,), device=relative_actions.device)
 
-        # Create training batch with full normalized relative sequence and delays
-        # The inner model will extract prefix/targets and do masking
+        # Create training batch with full normalized relative sequence
+        # Note: DELAYS not needed - inner model creates all delay variants during training
         training_batch = dict(batch)
         training_batch[ACTION] = relative_actions  # [batch, max_delay + chunk_size, action_dim]
-        training_batch[DELAYS] = delays
 
         if self.config.image_features:
             training_batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
 
+        # Inner model returns [B*D, chunk_size, action_dim] during training
         pred_relative_actions, (mu_hat, log_sigma_x2_hat) = self.model(training_batch)
 
-        # Extract targets for loss computation
-        targets = relative_actions[:, max_delay : max_delay + chunk_size]  # [batch, chunk_size, action_dim]
+        # Reshape predictions: [B*D, chunk_size, action_dim] -> [B, D, chunk_size, action_dim]
+        pred_relative_actions = pred_relative_actions.reshape(batch_size, n_delays, chunk_size, -1)
 
-        # Extract padding mask for targets only
-        action_is_pad_extended = batch["action_is_pad"]  # [batch, max_delay + chunk_size]
-        action_is_pad = action_is_pad_extended[:, max_delay : max_delay + chunk_size]  # [batch, chunk_size]
+        # Extract targets and expand to match: [B, chunk_size, action_dim] -> [B, D, chunk_size, action_dim]
+        targets = relative_actions[:, max_delay : max_delay + chunk_size]
+        targets = targets.unsqueeze(1).expand(-1, n_delays, -1, -1)
+
+        # Extract and expand padding mask: [B, chunk_size] -> [B, D, chunk_size]
+        action_is_pad = batch["action_is_pad"][:, max_delay : max_delay + chunk_size]
+        action_is_pad = action_is_pad.unsqueeze(1).expand(-1, n_delays, -1)
 
         # Compute L1 loss on targets (excluding padded actions)
         pad_mask = ~action_is_pad.unsqueeze(-1)
@@ -516,9 +518,6 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         l1_loss = (l1_loss_full * pad_mask).mean()
 
         loss_dict = {"l1_loss": l1_loss.item()}
-
-        # Track average delay for RTC training
-        loss_dict["rtc_avg_delay"] = delays.float().mean().item()
 
         if self.config.use_vae:
             mean_kld = (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
@@ -638,6 +637,10 @@ class ACTRelativeRTC(nn.Module):
         self.action_prefix_proj = nn.Linear(action_dim, config.dim_model)
         self.pad_embed = nn.Parameter(torch.zeros(config.dim_model))
 
+        # RTC: precompute delays template for training (avoids creating tensor each forward)
+        n_delays = config.rtc_max_delay + 1
+        self.register_buffer("_delays_template", torch.arange(n_delays, dtype=torch.long))
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -655,40 +658,44 @@ class ACTRelativeRTC(nn.Module):
           (normalized relative actions: prefix + targets)
         - Inference: batch[ACTION] has shape [batch, max_delay, action_dim]
           (normalized relative action prefix only)
-        - batch[DELAYS]: [batch] - delay per sample (0 to max_delay)
+        - batch[DELAYS]: [batch] - delay per sample (inference only, ignored during training)
         - batch[OBS_IMAGES]: list of image tensors (if using images)
         - batch[OBS_ENV_STATE]: environment state (if present)
 
         The model distinguishes training vs inference by the action sequence length.
+
+        Training mode:
+        - Backbone runs once on B samples
+        - Features are expanded to B*D virtual samples (D = max_delay + 1)
+        - Delays created from precomputed buffer (_delays_template)
+        - Returns predictions with shape [B*D, chunk_size, action_dim]
         """
         max_delay = self.config.rtc_max_delay
-        chunk_size = self.config.chunk_size
+        n_delays = max_delay + 1
 
         # Validate required batch keys
         assert ACTION in batch, f"batch must contain {ACTION}"
-        assert DELAYS in batch, f"batch must contain {DELAYS}"
 
         actions = batch[ACTION]
-        delays = batch[DELAYS]
+        delays = batch.get(DELAYS)  # Optional - only needed for inference
         action_seq_len = actions.shape[1]
 
         # Determine if training or inference based on action sequence length
-        is_training_batch = action_seq_len == max_delay + chunk_size
-        is_inference_batch = action_seq_len == max_delay
+        is_training_batch = action_seq_len == max_delay + self.config.chunk_size
 
-        assert is_training_batch or is_inference_batch, (
+        assert is_training_batch or action_seq_len == max_delay, (
             f"batch[ACTION].shape[1]={action_seq_len} must be either "
-            f"max_delay + chunk_size = {max_delay + chunk_size} (training) or "
+            f"max_delay + chunk_size = {max_delay + self.config.chunk_size} (training) or "
             f"max_delay = {max_delay} (inference)"
         )
 
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        device = batch[OBS_ENV_STATE].device if OBS_ENV_STATE in batch else batch[OBS_IMAGES][0].device
 
-        # VAE encoder (training only)
+        # VAE encoder (training only) - runs on original batch_size before expansion
         if self.config.use_vae and is_training_batch and self.training:
-            # Extract targets from the full action sequence
-            action_targets = actions[:, max_delay : max_delay + chunk_size]
-            action_is_pad_targets = batch["action_is_pad"][:, max_delay : max_delay + chunk_size]
+            action_targets = actions[:, max_delay : max_delay + self.config.chunk_size]
+            action_is_pad_targets = batch["action_is_pad"][:, max_delay : max_delay + self.config.chunk_size]
 
             cls_embed = einops.repeat(self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size)
             action_embed = self.vae_encoder_action_input_proj(action_targets)
@@ -696,11 +703,7 @@ class ACTRelativeRTC(nn.Module):
             vae_encoder_input = torch.cat([cls_embed, action_embed], axis=1)
             pos_embed = self.vae_encoder_pos_enc.clone().detach()
 
-            cls_joint_is_pad = torch.full(
-                (batch_size, 1),
-                False,
-                device=vae_encoder_input.device,
-            )
+            cls_joint_is_pad = torch.full((batch_size, 1), False, device=vae_encoder_input.device)
             key_padding_mask = torch.cat([cls_joint_is_pad, action_is_pad_targets], axis=1)
 
             cls_token_out = self.vae_encoder(
@@ -715,9 +718,9 @@ class ACTRelativeRTC(nn.Module):
             latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
         else:
             mu = log_sigma_x2 = None
-            device = batch[OBS_ENV_STATE].device if OBS_ENV_STATE in batch else batch[OBS_IMAGES][0].device
             latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(device)
 
+        # Build encoder input tokens from latent, env_state, and image features
         encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
         encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
 
@@ -734,9 +737,34 @@ class ACTRelativeRTC(nn.Module):
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
 
+        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)  # [N_tokens, B, dim]
+        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)  # [N_tokens, B or 1, dim]
+
+        # Training: expand features for all delays (AFTER backbone, BEFORE encoder)
+        if is_training_batch and self.training:
+            n_tokens = encoder_in_tokens.shape[0]
+
+            # Expand encoder tokens: [N_tokens, B, dim] -> [N_tokens, B*D, dim]
+            encoder_in_tokens = encoder_in_tokens.unsqueeze(2).expand(-1, -1, n_delays, -1)
+            encoder_in_tokens = encoder_in_tokens.reshape(n_tokens, batch_size * n_delays, -1)
+
+            # Expand pos_embed: always (n_tokens, 1, dim) -> (n_tokens, B*D, dim)
+            encoder_in_pos_embed = encoder_in_pos_embed.expand(-1, batch_size * n_delays, -1)
+
+            # Expand precomputed delays template: [D] -> [B*D]
+            delays = self._delays_template.unsqueeze(0).expand(batch_size, -1).reshape(-1)
+
+            # Expand actions: [B, seq_len, action_dim] -> [B*D, seq_len, action_dim]
+            actions = (
+                actions.unsqueeze(1).expand(-1, n_delays, -1, -1).reshape(batch_size * n_delays, -1, actions.shape[-1])
+            )
+
+            batch_size_effective = batch_size * n_delays
+        else:
+            batch_size_effective = batch_size
+
         # RTC: Process action prefix
-        # Extract prefix from batch[ACTION]
-        action_prefix = actions[:, :max_delay]  # [batch, max_delay, action_dim]
+        action_prefix = actions[:, :max_delay]
 
         if max_delay > 0:
             action_prefix_embed = self.action_prefix_proj(action_prefix)
@@ -748,21 +776,21 @@ class ACTRelativeRTC(nn.Module):
                 self.pad_embed[None, None, :].expand_as(action_prefix_embed),
                 action_prefix_embed,
             )
-            encoder_in_tokens.extend(list(action_prefix_embed.permute(1, 0, 2)))
 
-            # Create positional embeddings for prefix tokens
-            num_positions_offset = len(encoder_in_pos_embed)
+            prefix_tokens = action_prefix_embed.permute(1, 0, 2)
+            encoder_in_tokens = torch.cat([encoder_in_tokens, prefix_tokens], dim=0)
+
+            # Positional embeddings for prefix tokens
+            num_positions_offset = encoder_in_pos_embed.shape[0]
             prefix_pos_embed = create_sinusoidal_pos_embedding(num_positions_offset + max_delay, self.config.dim_model)[
                 num_positions_offset:
-            ].to(device=action_prefix.device, dtype=encoder_in_tokens[0].dtype)
-            encoder_in_pos_embed.extend(list(prefix_pos_embed.unsqueeze(1)))
-
-        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+            ].to(device=device, dtype=encoder_in_tokens.dtype)
+            prefix_pos_embed = prefix_pos_embed.unsqueeze(1).expand(-1, batch_size_effective, -1)
+            encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, prefix_pos_embed], dim=0)
 
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
         decoder_in = torch.zeros(
-            (self.config.chunk_size, batch_size, self.config.dim_model),
+            (self.config.chunk_size, batch_size_effective, self.config.dim_model),
             dtype=encoder_in_pos_embed.dtype,
             device=encoder_in_pos_embed.device,
         )
@@ -774,9 +802,9 @@ class ACTRelativeRTC(nn.Module):
         )
 
         decoder_out = decoder_out.transpose(0, 1)
-        actions = self.action_head(decoder_out)
+        actions_out = self.action_head(decoder_out)
 
-        return actions, (mu, log_sigma_x2)
+        return actions_out, (mu, log_sigma_x2)
 
 
 class ACTEncoder(nn.Module):
