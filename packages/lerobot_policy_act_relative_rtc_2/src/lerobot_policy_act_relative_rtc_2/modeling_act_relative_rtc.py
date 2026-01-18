@@ -517,11 +517,13 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         l1_loss_full = F.l1_loss(targets, pred_relative_actions, reduction="none")
         l1_loss = (l1_loss_full * pad_mask).mean()
 
-        loss_dict = {"l1_loss": l1_loss.item()}
+        # Return detached tensors in loss_dict to avoid GPU-CPU sync every step.
+        # The values will be converted to Python scalars only when actually logged.
+        loss_dict = {"l1_loss": l1_loss.detach()}
 
         if self.config.use_vae:
             mean_kld = (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
-            loss_dict["kld_loss"] = mean_kld.item()
+            loss_dict["kld_loss"] = mean_kld.detach()
             loss = l1_loss + mean_kld * self.config.kl_weight
         else:
             loss = l1_loss
@@ -641,6 +643,32 @@ class ACTRelativeRTC(nn.Module):
         n_delays = config.rtc_max_delay + 1
         self.register_buffer("_delays_template", torch.arange(n_delays, dtype=torch.long))
 
+        # RTC: precompute prefix positional embeddings (avoids CPU tensor creation every forward)
+        # Calculate num_positions_offset: number of encoder tokens before prefix
+        # = n_1d_tokens (latent + env_state) + n_image_tokens (49 per camera for 224x224 input)
+        max_delay = config.rtc_max_delay
+        if max_delay > 0:
+            # Calculate image feature map size from config
+            n_cameras = len(config.image_features) if config.image_features else 0
+            img_size = config.downscale_img_square
+            # ResNet backbone outputs feature map of size input_size/32
+            feature_map_size = img_size // 32
+            n_image_tokens_per_camera = feature_map_size * feature_map_size
+            n_image_tokens = n_cameras * n_image_tokens_per_camera
+
+            # 1D tokens: latent + env_state (if present)
+            n_1d_tokens_encoder = 1  # latent
+            if config.env_state_feature:
+                n_1d_tokens_encoder += 1
+
+            num_positions_offset = n_1d_tokens_encoder + n_image_tokens
+            total_positions = num_positions_offset + max_delay
+
+            # Precompute and register the prefix positional embeddings
+            full_pos_embed = create_sinusoidal_pos_embedding(total_positions, config.dim_model)
+            prefix_pos_embed = full_pos_embed[num_positions_offset:]  # [max_delay, dim_model]
+            self.register_buffer("_prefix_pos_embed", prefix_pos_embed)
+
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -689,8 +717,8 @@ class ACTRelativeRTC(nn.Module):
             f"max_delay = {max_delay} (inference)"
         )
 
-        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
-        device = batch[OBS_ENV_STATE].device if OBS_ENV_STATE in batch else batch[OBS_IMAGES][0].device
+        batch_size = actions.shape[0]
+        device = actions.device
 
         # VAE encoder (training only) - runs on original batch_size before expansion
         if self.config.use_vae and is_training_batch and self.training:
@@ -780,12 +808,8 @@ class ACTRelativeRTC(nn.Module):
             prefix_tokens = action_prefix_embed.permute(1, 0, 2)
             encoder_in_tokens = torch.cat([encoder_in_tokens, prefix_tokens], dim=0)
 
-            # Positional embeddings for prefix tokens
-            num_positions_offset = encoder_in_pos_embed.shape[0]
-            prefix_pos_embed = create_sinusoidal_pos_embedding(num_positions_offset + max_delay, self.config.dim_model)[
-                num_positions_offset:
-            ].to(device=device, dtype=encoder_in_tokens.dtype)
-            prefix_pos_embed = prefix_pos_embed.unsqueeze(1).expand(-1, batch_size_effective, -1)
+            # Use precomputed prefix positional embeddings (avoids CPU tensor creation)
+            prefix_pos_embed = self._prefix_pos_embed.unsqueeze(1).expand(-1, batch_size_effective, -1)
             encoder_in_pos_embed = torch.cat([encoder_in_pos_embed, prefix_pos_embed], dim=0)
 
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
