@@ -4,8 +4,7 @@ version = "0.1.0"
 description = "ACT policy with relative joint representations for LeRobot (v2 - single obs, full action prefix)."
 requires-python = ">=3.10"
 dependencies = [
-  # Pinned to commit 6d0d65a (2025-12-28) - latest main, ahead of PyPI 0.4.2
-  "lerobot @ git+https://github.com/huggingface/lerobot.git@6d0d65a5fec490c966b186bf9455ed3ea82f3f52",
+  "lerobot @ git+https://github.com/huggingface/lerobot.git@46e19ae579f80ce66211afafd1c3c649c569131f",
 ]
 
 [build-system]

@@ -7,7 +7,10 @@ no-binary-package = ["av"]
 members = ["packages/*"]
 
 [dependency-groups]
-dev = ["ruff>=0.14.11"]
+dev = [
+    "pdbpp>=0.11.7",
+    "ruff>=0.14.11",
+]
 
 [tool.ruff]
 line-length = 120
