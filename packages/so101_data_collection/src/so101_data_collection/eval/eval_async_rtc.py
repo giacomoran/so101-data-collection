@@ -1,20 +1,25 @@
 #!/usr/bin/env python
-"""Asynchronous ACT Relative RTC policy evaluation with Real-Time Chunking (RTC).
+"""Asynchronous ACT Relative RTC V2 policy evaluation with Real-Time Chunking (RTC).
 
 This script extends eval_async_discard.py to support Real-Time Chunking (RTC),
 where the policy is conditioned on an action prefix (the first `delay` steps of
 the action chunk being executed during inference). This enables smoother chunk
 transitions without discontinuities.
 
+Uses act_relative_rtc_2 policy which:
+- Uses relative joint positions (action - obs_state) for action representation
+- Does NOT use delta observation in the encoder (V2 simplification)
+- Handles absolute-to-relative prefix conversion internally in predict_action_chunk
+
 Key differences from eval_async_discard.py:
 - Action prefix is passed to the policy during inference
 - The prefix consists of the next `delay` actions that will execute during inference
-- The prefix is converted from absolute to relative actions and normalized
-- The policy returns a chunk consistent with the prefix
+- The policy converts absolute prefix to relative internally (V2)
+- The policy returns a normalized relative action chunk
 
 Architecture:
 - Actor thread: runs at fps, switches to new chunks when available, passes action prefix
-- Inference thread: triggered by actor, converts prefix to relative/normalized, runs inference
+- Inference thread: triggered by actor, runs inference with absolute prefix
 - Shared state: current observation, pending chunk, inference status, RTC prefix data
 - No action queue merging needed - clean chunk switches
 
@@ -35,7 +40,6 @@ import math
 import sys
 import time
 import traceback
-from collections import deque
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -57,14 +61,13 @@ from lerobot.rl.process import ProcessSignalHandler
 from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
-    so100_follower,
-    so101_follower,
 )
+from lerobot.robots.so_follower import SO101FollowerConfig  # noqa: F401
 from lerobot.utils.control_utils import init_keyboard_listener, is_headless
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say
 from lerobot.utils.visualization_utils import init_rerun
-from lerobot_policy_act_relative_rtc import ACTRelativeRTCConfig  # noqa: F401
+from lerobot_policy_act_relative_rtc_2 import ACTRelativeRTCConfig  # noqa: F401
 
 from so101_data_collection.eval.rerun_utils import (
     log_rerun_data,
@@ -140,17 +143,22 @@ class EvalAsyncRTCConfig:
 class ActionChunk:
     """A chunk of actions with associated timing information.
 
+    Actions are stored as ABSOLUTE joint positions (ready to send to robot).
+    The obs_state field records the observation state at inference time,
+    which was used to convert relative actions to absolute:
+        absolute_action = relative_action + obs_state
+
     Attributes:
-        actions: Action tensor [n_actions, action_dim]
+        actions: Action tensor [n_actions, action_dim] - ABSOLUTE joint positions
+        obs_state: Observation state tensor [1, state_dim] at inference time
         obs_timestep: Timestep when actions[0] should execute
         chunk_idx: Inference counter that generated this chunk (for logging)
-        obs_state: Observation state tensor [state_dim] used to create this chunk
     """
 
     actions: torch.Tensor
+    obs_state: torch.Tensor
     obs_timestep: int
     chunk_idx: int
-    obs_state: torch.Tensor
 
     def get_action_at(self, timestep: int) -> torch.Tensor | None:
         """Get action for the given timestep.
@@ -188,9 +196,7 @@ class ActionChunk:
 class State:
     """Centralized state for robot operations and thread communication."""
 
-    obs_delta_frames: int = 1
-
-    # Current observation and its timestep (updated by actor)
+    # Current observation (raw dict with images) and its timestep (updated by actor)
     current_obs: dict | None = None
     obs_timestep: int = 0
 
@@ -203,9 +209,6 @@ class State:
     # Inference control (actor requests, inference thread runs)
     inference_running: bool = False
 
-    # Observation history for delta computation (shared between threads)
-    obs_history: deque | None = None
-
     # Shutdown event (shared across main, actor, and inference threads)
     shutdown_event: Event | None = None
 
@@ -213,12 +216,12 @@ class State:
     total_actions_counter: list[int] | None = None
 
     # Lock for thread-safe access
+    # Note: Using Optional[Lock] instead of Lock | None to avoid dataclass issues
     lock: Optional[Lock] = None
 
     inference_requested: Event | None = None
 
     def __post_init__(self):
-        self.obs_history = deque(maxlen=self.obs_delta_frames + 1)
         self.lock = Lock()
         self.inference_requested = Event()
         self.total_actions_counter = [0]
@@ -240,9 +243,7 @@ def inference_thread_fn(
     motor_names: list[str],
     camera_names: list[str],
     latency_tracker: LatencyTracker,
-    obs_state_delta_frames: int,
     robot_type: str,
-    execution_latency_timesteps: int,
 ) -> None:
     """Inference thread: waits for signal, runs inference with RTC, creates new action chunk.
 
@@ -250,12 +251,9 @@ def inference_thread_fn(
     1. Waits for inference_requested event from actor
     2. Gets latest observation and active chunk from shared state
     3. Computes prefix from active chunk (up to rtc_max_delay)
-    4. Converts absolute prefix to relative, then normalizes it
-    5. Runs policy inference with delay and action_prefix
-    6. Creates new ActionChunk and stores in shared_state
-    7. Repeats until shutdown
-
-    The observation history is maintained by the actor thread for delta computation.
+    4. Runs policy inference with delay and absolute action_prefix
+    5. Creates new ActionChunk and stores in shared_state
+    6. Repeats until shutdown
     """
     use_amp = policy.config.use_amp
     chunk_idx = 0  # Counter for number of inferences performed
@@ -281,17 +279,12 @@ def inference_thread_fn(
                     state.inference_running = False
                     continue
 
-                # Compute delta observation from history (most recent - oldest)
-                # Only compute if we have enough history
-                if len(state.obs_history) >= 2:
-                    obs_delta = state.obs_history[-1] - state.obs_history[0]
-                    obs_state = state.obs_history[-1]
-                else:
-                    # Not enough history, skip this inference and reset flag so actor can retry
-                    state.inference_running = False
-                    continue
+            # Compute observation state from raw_obs (outside lock to minimize lock time)
+            state_values = [raw_obs[motor_name] for motor_name in motor_names]
+            obs_state = torch.tensor(np.array(state_values, dtype=np.float32), device=device).unsqueeze(0)
 
             # Compute prefix from active chunk (use all remaining actions up to rtc_max_delay)
+            # V2: We pass absolute action_prefix; the policy converts to relative internally
             if active_chunk is not None:
                 remaining = active_chunk.remaining_from(obs_timestep)
                 delay = min(rtc_max_delay, remaining)
@@ -300,25 +293,19 @@ def inference_thread_fn(
                     idx_start = obs_timestep - active_chunk.obs_timestep
                     action_prefix_absolute = active_chunk.actions[idx_start : idx_start + delay]
                     action_prefix_absolute = action_prefix_absolute.unsqueeze(0)
-                    # Use CHUNK's observation for conversion (matches training)
-                    active_chunk_obs_state = active_chunk.obs_state.unsqueeze(0)
                 else:
                     action_prefix_absolute = None
-                    active_chunk_obs_state = None
                     delay = 0
             else:
                 action_prefix_absolute = None
-                active_chunk_obs_state = None
                 delay = 0
 
             # Check shutdown after potentially blocking
             if state.shutdown_event.is_set():
                 break
 
-            # Build observation frame
+            # Build observation frame (images only - state comes from actor's obs_state)
             observation_frame = {}
-            state_values = [raw_obs[motor_name] for motor_name in motor_names]
-            observation_frame["observation.state"] = np.array(state_values, dtype=np.float32)
             for cam_name in camera_names:
                 observation_frame[f"observation.images.{cam_name}"] = raw_obs[cam_name]
 
@@ -329,37 +316,21 @@ def inference_thread_fn(
                 torch.inference_mode(),
                 torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
             ):
-                # Prepare observation and apply preprocessor
+                # Prepare observation and apply preprocessor (for images)
                 observation = prepare_observation_for_inference(observation_frame, device, None, robot_type)
                 observation = preprocessor(observation)
 
-                # Normalize delta observation if stats are available
-                if policy.has_relative_stats:
-                    obs_delta_normalized = policy.delta_obs_normalizer(obs_delta)
-                else:
-                    obs_delta_normalized = obs_delta
-
-                # Create inference batch with delta observation
+                # Create inference batch with observation state from actor
+                # V2: predict_action_chunk uses obs_state for prefix conversion (raw, not normalized)
                 inference_batch = dict(observation)
-                inference_batch["observation.state"] = obs_delta_normalized
-
-                # Convert absolute prefix to relative, then normalize
-                if action_prefix_absolute is not None and delay > 0:
-                    # relative = absolute - chunk_obs_state (matches training: use chunk's observation)
-                    action_prefix_relative = action_prefix_absolute - active_chunk_obs_state.unsqueeze(1)
-
-                    # Normalize if stats available
-                    if policy.has_relative_stats:
-                        action_prefix_relative = policy.relative_action_normalizer(action_prefix_relative)
-                else:
-                    action_prefix_relative = None
-                    delay = 0
+                inference_batch["observation.state"] = obs_state
 
                 # Get normalized relative action chunk from policy with RTC params
+                # V2: predict_action_chunk expects absolute action_prefix (converts internally)
                 relative_actions_normalized = policy.predict_action_chunk(
                     inference_batch,
                     delay=delay,
-                    action_prefix=action_prefix_relative,
+                    action_prefix=action_prefix_absolute,
                 )
                 # Shape: [batch, chunk_size, action_dim]
 
@@ -393,10 +364,10 @@ def inference_thread_fn(
             # The policy assumes that action[0] is executed at obs_timestep
             with state.lock:
                 state.pending_chunk = ActionChunk(
-                    chunk_idx=chunk_idx,
-                    actions=absolute_actions.squeeze(0),  # [n_actions, action_dim],
+                    actions=absolute_actions.squeeze(0),  # [n_actions, action_dim]
+                    obs_state=obs_state,  # [1, state_dim]
                     obs_timestep=obs_timestep,
-                    obs_state=obs_state.squeeze(0),  # Store the observation used to create this chunk
+                    chunk_idx=chunk_idx,
                 )
                 state.inference_running = False
 
@@ -427,8 +398,6 @@ def actor_thread_fn(
     state: State,
     ds_features,
     cfg: EvalAsyncRTCConfig,
-    device: torch.device,
-    motor_names: list[str],
 ) -> None:
     """Actor thread: executes actions from current chunk at target fps.
 
@@ -480,9 +449,6 @@ def actor_thread_fn(
 
             if control_frame:
                 # Control pipeline: update state, check chunks, pick action, trigger inference
-                state_values = [raw_obs[motor_name] for motor_name in motor_names]
-                obs_state = torch.tensor(np.array(state_values, dtype=np.float32), device=device).unsqueeze(0)
-
                 effective_t = t + execution_latency_timesteps
 
                 # 2. Acquire lock
@@ -490,7 +456,6 @@ def actor_thread_fn(
                     # 3. Update state with observation
                     state.current_obs = raw_obs.copy()
                     state.obs_timestep = t
-                    state.obs_history.append(obs_state)
 
                     # 4. Check for pending chunk
                     if state.pending_chunk:
@@ -621,14 +586,11 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
     logging.info(f"Loading policy from {cfg.policy.pretrained_path}...")
     policy = make_policy(cfg.policy, ds_meta=ds_meta, env_cfg=None)
 
-    # Check for RTC support
-    if not hasattr(policy.config, "rtc_max_delay"):
-        logging.warning(
-            "Policy does not support RTC (no rtc_max_delay config). Falling back to delay=0 (vanilla async)."
-        )
-        rtc_max_delay = 0
+    # Log RTC support
+    rtc_max_delay = getattr(policy.config, "rtc_max_delay", 0)
+    if rtc_max_delay == 0:
+        logging.warning("Policy rtc_max_delay=0, running without RTC prefix conditioning.")
     else:
-        rtc_max_delay = policy.config.rtc_max_delay
         logging.info(f"Policy RTC max delay: {rtc_max_delay}")
 
     # Override device processor to use the detected device (cuda/cpu/mps)
@@ -636,7 +598,7 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
         "device_processor": {"device": str(policy.config.device)},
     }
 
-    preprocessor, postprocessor = make_pre_post_processors(
+    preprocessor, _ = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
         preprocessor_overrides=preprocessor_overrides,
@@ -646,8 +608,7 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
     latency_tracker = LatencyTracker()
 
     # Setup signal handler for graceful shutdown
-    signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
-    shutdown_event = signal_handler.shutdown_event
+    ProcessSignalHandler(use_threads=True, display_pid=False)
 
     # Setup keyboard listener for early termination
     listener = None
@@ -656,10 +617,11 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
         listener, events = init_keyboard_listener()
         logging.info("Press ESC to terminate episode early")
 
-        # Track threads for cleanup
-        inference_thread = None
-        actor_thread = None
-        start_episode_t = None
+    # Track threads and state for cleanup
+    inference_thread = None
+    actor_thread = None
+    start_episode_t = None
+    state = None
 
     try:
         # Connect robot
@@ -670,29 +632,21 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
         # Run episode
         log_say("Starting evaluation", cfg.play_sounds)
 
+        # Precompute timing constants
+        dt_ms = 1000.0 / cfg.fps
+        execution_latency_timesteps = int(math.ceil(cfg.execution_latency_ms / dt_ms))
+
         logging.info(f"Starting episode (max {cfg.episode_time_s}s at {cfg.fps} fps)")
-        logging.info(f"Execution latency: {cfg.execution_latency_ms}ms")
+        logging.info(f"Execution latency: {cfg.execution_latency_ms}ms ({execution_latency_timesteps} timesteps)")
         logging.info(f"Remaining actions threshold: {cfg.remaining_actions_threshold}")
 
         # Reset policy and processors
         policy.reset()
         preprocessor.reset()
-        postprocessor.reset()
         latency_tracker.reset()
 
-        # Get delta frames config
-        obs_state_delta_frames = getattr(policy.config, "obs_state_delta_frames", 1)
-
-        # Precompute timing constants
-        dt_ms = 1000.0 / cfg.fps
-        execution_latency_timesteps = int(math.ceil(cfg.execution_latency_ms / dt_ms))
-
-        # Log computed values
-        logging.info(f"Execution latency: {execution_latency_timesteps} timesteps")
-        logging.info(f"Delta frames: {obs_state_delta_frames}")
-
         # Create shared state
-        state = State(obs_delta_frames=obs_state_delta_frames)
+        state = State()
 
         # Setup rerun styling
         if cfg.display_data:
@@ -731,9 +685,7 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
                 motor_names,
                 camera_names,
                 latency_tracker,
-                obs_state_delta_frames,
                 robot_type,
-                execution_latency_timesteps,
             ),
             daemon=True,
             name="Inference",
@@ -748,8 +700,6 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
                 state,
                 ds_features,
                 cfg,
-                device,
-                motor_names,
             ),
             daemon=True,
             name="Actor",
@@ -780,7 +730,7 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
 
     finally:
         # Signal threads to shutdown
-        if "state" in locals():
+        if state is not None:
             state.shutdown_event.set()
             state.inference_requested.set()
 
@@ -817,27 +767,24 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
                 logging.info("Actor thread already finished")
 
         # Log final stats
-        if start_episode_t is not None:
+        if start_episode_t is not None and state is not None:
             total_time = time.perf_counter() - start_episode_t
-            total_actions = state.total_actions_counter[0] if "state" in locals() else 0
+            total_actions = state.total_actions_counter[0]
             actual_fps = total_actions / total_time if total_time > 0 else 0
             logging.info(f"Episode complete: {total_actions} actions in {total_time:.1f}s ({actual_fps:.1f} fps)")
 
             # Log data to rerun
-            if "cfg" in locals() and cfg.display_data and recording_path is not None:
+            if cfg.display_data and recording_path is not None:
                 latency_tracker.log_summary_to_rerun()
                 logging.info(f"Rerun recording saved to {recording_path}")
-                logging.info("Export recording from ReRun to create plot")
 
             # Print stats
-            if "latency_tracker" in locals():
-                latency_stats = latency_tracker.get_stats()
-
-                if latency_stats:
-                    logging.info(
-                        f"Inference latency: mean={latency_stats['mean']:.1f}ms, "
-                        f"std={latency_stats['std']:.1f}ms, p95={latency_stats['p95']:.1f}ms"
-                    )
+            latency_stats = latency_tracker.get_stats()
+            if latency_stats:
+                logging.info(
+                    f"Inference latency: mean={latency_stats['mean']:.1f}ms, "
+                    f"std={latency_stats['std']:.1f}ms, p95={latency_stats['p95']:.1f}ms"
+                )
 
         # Cleanup
         if robot and robot.is_connected:
