@@ -50,23 +50,15 @@ class ACTRelativeRTCConfig(PreTrainedConfig):
         n_obs_steps: Number of environment steps worth of observations to pass to the policy.
         chunk_size: The size of the action prediction "chunks" in units of environment steps.
         n_action_steps: The number of action steps to run in the environment for one invocation.
-        obs_state_delta_frames: Number of frames back for computing observation state delta.
         rtc_max_delay: Maximum delay for RTC training (must be >= 1).
         downscale_img_square: Target square resolution for image preprocessing. If None, no resizing.
         ... (other args same as ACTConfig)
     """
 
     # Input / output structure.
-    n_obs_steps: int = 2  # Kept for backward compatibility, but see obs_state_delta_frames
+    n_obs_steps: int = 2  # Kept for backward compatibility
     chunk_size: int = 100
     n_action_steps: int = 100
-
-    # Number of frames back for computing observation state delta.
-    # delta_obs = obs.state[t] - obs.state[t - obs_state_delta_frames]
-    # Default=1 means delta over 1 frame (33ms at 30Hz).
-    # Use obs_state_delta_frames=3 for delta over 3 frames (100ms at 30Hz, ~10Hz effective).
-    # Higher values give larger, more meaningful deltas when data is high-frequency.
-    obs_state_delta_frames: int = 1
 
     # Real-Time Chunking (RTC) - training-time action prefix conditioning
     # The model is trained with random action prefixes to simulate inference-time delays,

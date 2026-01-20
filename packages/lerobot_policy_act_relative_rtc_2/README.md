@@ -108,8 +108,6 @@ Key configuration parameters in `ACTRelativeRTCConfig`:
 - `chunk_size`: Action chunk size (default: 100)
 - `n_action_steps`: Number of actions to execute per inference (default: 100)
 
-Note: `obs_state_delta_frames` is kept for backward compatibility but is no longer used in v2 (state_delta_indices always returns [0])
-
 ## Architecture (V2)
 
 ```
