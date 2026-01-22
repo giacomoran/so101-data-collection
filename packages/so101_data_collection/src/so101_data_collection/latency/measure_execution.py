@@ -33,9 +33,7 @@ from pathlib import Path
 import numpy as np
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
-from lerobot.robots.so101_follower.config_so101_follower import (
-    SO101FollowerConfig,
-)
+from lerobot.robots.so_follower import SO101FollowerConfig
 from scipy import signal
 
 # Add project root to Python path for imports
@@ -142,9 +140,7 @@ def compute_latency_cross_correlation(
     return latency_ms, peak_corr
 
 
-def get_motor_center_position(
-    bus: FeetechMotorsBus, motor_name: str, robot_id: str | None = None
-) -> int:
+def get_motor_center_position(bus: FeetechMotorsBus, motor_name: str, robot_id: str | None = None) -> int:
     """
     Get the center position for a motor (middle of joint range).
 
@@ -166,16 +162,11 @@ def get_motor_center_position(
             min_pos = cal.min_position
             max_pos = cal.max_position
             center_raw = int((min_pos + max_pos) / 2)
-            logger.debug(
-                f"{motor_name}: calibration center = {center_raw} "
-                f"(range: {min_pos}-{max_pos})"
-            )
+            logger.debug(f"{motor_name}: calibration center = {center_raw} (range: {min_pos}-{max_pos})")
             return center_raw
 
     # Fallback to servo center if no calibration
-    logger.warning(
-        f"{motor_name}: No calibration available, using servo center ({SERVO_CENTER_RAW})"
-    )
+    logger.warning(f"{motor_name}: No calibration available, using servo center ({SERVO_CENTER_RAW})")
     return SERVO_CENTER_RAW
 
 
@@ -210,9 +201,7 @@ def move_all_motors_to_center(
     # Get center (target) positions for all motors
     target_positions = {}
     for motor_name in motors:
-        target_positions[motor_name] = get_motor_center_position(
-            bus, motor_name, robot_id
-        )
+        target_positions[motor_name] = get_motor_center_position(bus, motor_name, robot_id)
         logger.info(f"  {motor_name}: target = {target_positions[motor_name]}")
 
     # Enable torque on all motors
@@ -220,15 +209,11 @@ def move_all_motors_to_center(
     time.sleep(0.1)
 
     # Read current positions
-    current_positions = bus.sync_read(
-        "Present_Position", motors=motors, normalize=False
-    )
+    current_positions = bus.sync_read("Present_Position", motors=motors, normalize=False)
     logger.info("Current positions:")
     for motor_name in motors:
         diff = target_positions[motor_name] - current_positions[motor_name]
-        logger.info(
-            f"  {motor_name}: {current_positions[motor_name]} (need to move {diff:+d})"
-        )
+        logger.info(f"  {motor_name}: {current_positions[motor_name]} (need to move {diff:+d})")
 
     # Calculate step size based on speed and update rate
     step_size = speed_raw_per_sec / update_rate_hz
@@ -327,17 +312,12 @@ def run_sinusoidal_test(
     time.sleep(0.1)
 
     # Ensure motor is at center position (should already be there, but verify)
-    logger.info(
-        f"Ensuring {motor_name} is at center position ({center_raw} raw units)..."
-    )
+    logger.info(f"Ensuring {motor_name} is at center position ({center_raw} raw units)...")
     bus.sync_write("Goal_Position", {motor_name: center_raw}, normalize=False)
     time.sleep(1.0)  # Brief wait to ensure position
 
     logger.info(f"Starting sinusoidal test for {motor_name}")
-    logger.info(
-        f"  Frequency: {frequency_hz} Hz, Amplitude: ±{amplitude_raw} raw units, "
-        f"Duration: {duration_s}s"
-    )
+    logger.info(f"  Frequency: {frequency_hz} Hz, Amplitude: ±{amplitude_raw} raw units, Duration: {duration_s}s")
 
     start_time = time.perf_counter()
     last_sample_time = start_time
@@ -351,17 +331,13 @@ def run_sinusoidal_test(
                 break
 
             # Generate sinusoidal command in raw units
-            cmd_raw = center_raw + int(
-                amplitude_raw * np.sin(2 * np.pi * frequency_hz * elapsed)
-            )
+            cmd_raw = center_raw + int(amplitude_raw * np.sin(2 * np.pi * frequency_hz * elapsed))
 
             # Send command (raw values, no normalization)
             bus.sync_write("Goal_Position", {motor_name: cmd_raw}, normalize=False)
 
             # Read actual position (raw values)
-            positions = bus.sync_read(
-                "Present_Position", motors=[motor_name], normalize=False
-            )
+            positions = bus.sync_read("Present_Position", motors=[motor_name], normalize=False)
             actual_raw = positions[motor_name]
 
             # Record sample
@@ -423,36 +399,26 @@ def run_measurement(
 
             # Access the calibrated bus from the config
             # Note: The config may need to be initialized/connected first
-            if hasattr(robot_config, "_motors_bus") or hasattr(
-                robot_config, "motors_bus"
-            ):
+            if hasattr(robot_config, "_motors_bus") or hasattr(robot_config, "motors_bus"):
                 # Try to get the motors_bus (it may be lazy-loaded)
-                calibrated_bus = getattr(robot_config, "motors_bus", None) or getattr(
-                    robot_config, "_motors_bus", None
-                )
+                calibrated_bus = getattr(robot_config, "motors_bus", None) or getattr(robot_config, "_motors_bus", None)
 
                 if calibrated_bus is None:
                     # Motors bus might be created lazily, try creating robot instance
-                    from lerobot.robots.so101_follower import SO101Follower
+                    from lerobot.robots.so_follower import SO101Follower
 
                     temp_robot = SO101Follower(robot_config)
                     temp_robot.connect()
                     calibrated_bus = temp_robot.motors_bus
                     temp_robot.disconnect()
 
-                if (
-                    calibrated_bus
-                    and hasattr(calibrated_bus, "calibration")
-                    and calibrated_bus.calibration
-                ):
+                if calibrated_bus and hasattr(calibrated_bus, "calibration") and calibrated_bus.calibration:
                     bus.calibration = calibrated_bus.calibration
                     logger.info("Calibration loaded successfully")
                 else:
                     logger.warning("Robot config bus has no calibration")
             else:
-                logger.warning(
-                    f"Could not access motors_bus from config for {robot_id}"
-                )
+                logger.warning(f"Could not access motors_bus from config for {robot_id}")
         except Exception as e:
             logger.warning(f"Failed to load calibration: {e}, using servo center")
             import traceback
@@ -494,9 +460,7 @@ def run_measurement(
                 logger.warning(f"  Too few samples for {motor_name}, skipping")
                 continue
 
-            e2e_latency_ms, correlation = compute_latency_cross_correlation(
-                timestamps, commanded, actual
-            )
+            e2e_latency_ms, correlation = compute_latency_cross_correlation(timestamps, commanded, actual)
 
             actual_sample_rate = len(timestamps) / (timestamps[-1] - timestamps[0])
 
@@ -509,9 +473,7 @@ def run_measurement(
             )
 
             logger.info(
-                f"  {motor_name}: e2e={e2e_latency_ms:.1f}ms, "
-                f"correlation={correlation:.3f}, "
-                f"samples={len(timestamps)}"
+                f"  {motor_name}: e2e={e2e_latency_ms:.1f}ms, correlation={correlation:.3f}, samples={len(timestamps)}"
             )
 
             # Brief pause between motors
@@ -521,10 +483,7 @@ def run_measurement(
         # Return all motors to center and disable torque
         logger.info("\nReturning all motors to center positions...")
         if motors_to_test:
-            center_positions = {
-                motor: get_motor_center_position(bus, motor, robot_id)
-                for motor in motors_to_test
-            }
+            center_positions = {motor: get_motor_center_position(bus, motor, robot_id) for motor in motors_to_test}
             bus.sync_write("Goal_Position", center_positions, normalize=False)
             time.sleep(2.0)
 
@@ -548,10 +507,7 @@ def print_results(result: MeasurementResult) -> None:
         print("No measurements recorded.")
         return
 
-    print(
-        f"{'Motor':<15} {'E2E (ms)':>12} {'l_action (ms)':>14} {'Correlation':>12} "
-        f"{'Samples':>10} {'Rate (Hz)':>10}"
-    )
+    print(f"{'Motor':<15} {'E2E (ms)':>12} {'l_action (ms)':>14} {'Correlation':>12} {'Samples':>10} {'Rate (Hz)':>10}")
     print("-" * 80)
 
     e2e_values = []
@@ -575,16 +531,9 @@ def print_results(result: MeasurementResult) -> None:
     # Aggregate statistics
     print("-" * 80)
     print(
-        f"{'AGGREGATE':<15} "
-        f"{np.mean(e2e_values):>11.2f}ms "
-        f"{np.mean(action_values):>13.2f}ms "
-        f"{'':>12} "
-        f"{'':>10} "
-        f"{'':>10}"
+        f"{'AGGREGATE':<15} {np.mean(e2e_values):>11.2f}ms {np.mean(action_values):>13.2f}ms {'':>12} {'':>10} {'':>10}"
     )
-    print(
-        f"{'(std)':<15} {np.std(e2e_values):>11.2f}ms {np.std(action_values):>13.2f}ms"
-    )
+    print(f"{'(std)':<15} {np.std(e2e_values):>11.2f}ms {np.std(action_values):>13.2f}ms")
 
     print("=" * 80)
     print("\nLegend:")
@@ -601,9 +550,7 @@ def save_csv(result: MeasurementResult, path: Path) -> None:
         writer.writerow(["motor", "timestamp", "commanded", "actual"])
 
         for motor_name, signal_data in result.signal_data.items():
-            for t, cmd, act in zip(
-                signal_data.timestamps, signal_data.commanded, signal_data.actual
-            ):
+            for t, cmd, act in zip(signal_data.timestamps, signal_data.commanded, signal_data.actual):
                 writer.writerow([motor_name, t, cmd, act])
 
     logger.info(f"Saved signal data to {path}")
@@ -625,9 +572,7 @@ def save_summary_csv(result: MeasurementResult, path: Path) -> None:
         )
 
         for motor_name, lat_result in result.per_motor.items():
-            action_latency = (
-                lat_result.e2e_latency_ms - result.proprioception_latency_ms
-            )
+            action_latency = lat_result.e2e_latency_ms - result.proprioception_latency_ms
             writer.writerow(
                 [
                     motor_name,

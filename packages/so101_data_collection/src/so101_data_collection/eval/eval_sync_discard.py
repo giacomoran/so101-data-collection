@@ -48,12 +48,11 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
-from lerobot.robots import (  # noqa: F401
+from lerobot.robots import (
     RobotConfig,
     make_robot_from_config,
-    so100_follower,
-    so101_follower,
 )
+from lerobot.robots.so_follower import SO101FollowerConfig  # noqa: F401
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,

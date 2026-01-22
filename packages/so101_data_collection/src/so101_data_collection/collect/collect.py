@@ -53,14 +53,8 @@ import numpy as np  # noqa: E402
 from lerobot.cameras.opencv import OpenCVCamera  # noqa: E402
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: E402
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
-from lerobot.robots.so101_follower import SO101Follower  # noqa: E402
-from lerobot.robots.so101_follower.config_so101_follower import (  # noqa: E402
-    SO101FollowerConfig,
-)
-from lerobot.teleoperators.so101_leader import SO101Leader  # noqa: E402
-from lerobot.teleoperators.so101_leader.config_so101_leader import (  # noqa: E402
-    SO101LeaderConfig,
-)
+from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig  # noqa: E402
+from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig  # noqa: E402
 from lerobot.utils.control_utils import (  # noqa: E402
     init_keyboard_listener,
     is_headless,
@@ -176,9 +170,7 @@ class CollectConfig:
     camera_height: int = CAMERA_HEIGHT
 
     # Dataset config
-    repo_id: str | None = (
-        None  # If None, defaults to giacomoran/so101_data_collection_{task}_{setup}
-    )
+    repo_id: str | None = None  # If None, defaults to giacomoran/so101_data_collection_{task}_{setup}
     dataset_root: Path = field(default_factory=lambda: DEFAULT_DATASET_ROOT)
 
     # Sound feedback
@@ -564,9 +556,7 @@ def _state_dict_to_array(state_dict: dict[str, float]) -> np.ndarray:
         if key in state_dict:
             values.append(state_dict[key])
         else:
-            raise KeyError(
-                f"Missing motor key {key} in state dict. Available: {list(state_dict.keys())}"
-            )
+            raise KeyError(f"Missing motor key {key} in state dict. Available: {list(state_dict.keys())}")
     return np.array(values, dtype=np.float32)
 
 
@@ -588,9 +578,7 @@ def flush_to_dataset(
             frame_dict: dict[str, Any] = {"task": episode.task}
 
             # Convert observation state dict to array
-            frame_dict["observation.state"] = _state_dict_to_array(
-                frame.observation_state
-            )
+            frame_dict["observation.state"] = _state_dict_to_array(frame.observation_state)
 
             # Add observation images
             for cam_name, image in frame.observation_images.items():
@@ -611,9 +599,7 @@ def collect(config: CollectConfig) -> None:
     """Main data collection function."""
     init_logging()
 
-    logger.info(
-        f"Starting data collection: task={config.task.value}, setup={config.setup.value}"
-    )
+    logger.info(f"Starting data collection: task={config.task.value}, setup={config.setup.value}")
     if config.is_benchmark_mode:
         assert config.benchmark_time_s is not None
         logger.info(
@@ -642,8 +628,7 @@ def collect(config: CollectConfig) -> None:
     repo_id = get_repo_id(config)
     # Enforce naming convention: HuggingFace repo names should use underscores, not hyphens
     assert "-" not in repo_id, (
-        f"repo_id '{repo_id}' contains hyphens. "
-        "Use underscores instead (e.g., 'user_name/repo_name')."
+        f"repo_id '{repo_id}' contains hyphens. Use underscores instead (e.g., 'user_name/repo_name')."
     )
     dataset_path = config.dataset_root / repo_id
 
@@ -707,16 +692,10 @@ def collect(config: CollectConfig) -> None:
         def should_continue() -> bool:
             if config.is_benchmark_mode:
                 assert config.benchmark_time_s is not None
-                return (
-                    session_elapsed < config.benchmark_time_s
-                    and not events["stop_recording"]
-                )
+                return session_elapsed < config.benchmark_time_s and not events["stop_recording"]
             else:
                 assert config.num_episodes is not None
-                return (
-                    recorded_episodes < config.num_episodes
-                    and not events["stop_recording"]
-                )
+                return recorded_episodes < config.num_episodes and not events["stop_recording"]
 
         while should_continue():
             episode_num = recorded_episodes + 1
@@ -778,23 +757,16 @@ def collect(config: CollectConfig) -> None:
                 episodes_to_flush = memory_buffer.get_episodes_to_flush()
                 encoding_time = flush_to_dataset(episodes_to_flush, dataset, config)
                 total_encoding_time += encoding_time
-                logger.info(
-                    f"Flushed {len(episodes_to_flush)} episodes to disk "
-                    f"(encoding took {encoding_time:.1f}s)"
-                )
+                logger.info(f"Flushed {len(episodes_to_flush)} episodes to disk (encoding took {encoding_time:.1f}s)")
 
             # Update elapsed time (excluding encoding time)
-            session_elapsed = (
-                time.perf_counter() - collection_start - total_encoding_time
-            )
+            session_elapsed = time.perf_counter() - collection_start - total_encoding_time
 
             # Reset time (skip if done)
             if should_continue():
                 log_say("Reset the environment", config.play_sounds)
                 reset_loop(events, config)
-                session_elapsed = (
-                    time.perf_counter() - collection_start - total_encoding_time
-                )
+                session_elapsed = time.perf_counter() - collection_start - total_encoding_time
 
         collection_end = time.perf_counter()
         total_collection_time = collection_end - collection_start
@@ -836,13 +808,9 @@ def collect(config: CollectConfig) -> None:
         logger.info(f"Recorded {recorded_episodes} episodes")
         logger.info(f"Total collection time: {total_collection_time:.1f}s")
         logger.info(f"Total encoding time: {total_encoding_time:.1f}s")
-        logger.info(
-            f"Net collection time: {total_collection_time - total_encoding_time:.1f}s"
-        )
+        logger.info(f"Net collection time: {total_collection_time - total_encoding_time:.1f}s")
         logger.info(f"Dataset saved to: {dataset_path}")
-        logger.info(
-            f"To push to HuggingFace Hub, run: python -m src.push_to_hub --dataset-name {repo_id}"
-        )
+        logger.info(f"To push to HuggingFace Hub, run: python -m src.push_to_hub --dataset-name {repo_id}")
 
     finally:
         # Cleanup

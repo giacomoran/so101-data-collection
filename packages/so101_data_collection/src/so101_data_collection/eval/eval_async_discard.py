@@ -56,12 +56,11 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.rl.process import ProcessSignalHandler
-from lerobot.robots import (  # noqa: F401
+from lerobot.robots import (
     RobotConfig,
     make_robot_from_config,
-    so100_follower,
-    so101_follower,
 )
+from lerobot.robots.so_follower import SO101FollowerConfig  # noqa: F401
 from lerobot.utils.control_utils import init_keyboard_listener, is_headless
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say

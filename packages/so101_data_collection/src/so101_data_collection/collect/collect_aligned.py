@@ -62,9 +62,8 @@ from typing import Any
 import cv2
 import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.robots.so101_follower import SO101Follower
-from lerobot.teleoperators.so101_leader import SO101Leader
-from lerobot.teleoperators.so101_leader.config_so101_leader import SO101LeaderConfig
+from lerobot.robots.so_follower import SO101Follower
+from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 from lerobot.utils.control_utils import init_keyboard_listener, is_headless
 from lerobot.utils.utils import init_logging, log_say
 
@@ -356,9 +355,7 @@ class ProprioceptionSampler:
                 data = {k: v for k, v in obs.items() if k.endswith(".pos")}
 
             with self._lock:
-                self._readings.append(
-                    TimestampedProprio(data=data.copy(), capture_time=capture_time)
-                )
+                self._readings.append(TimestampedProprio(data=data.copy(), capture_time=capture_time))
                 self._reading_count += 1
 
             # Sleep to maintain rate
@@ -496,9 +493,7 @@ def align_episode(
         # Interpolate proprioception at camera capture time
         proprio_data = interpolate_proprio(proprio, camera_capture_time)
         if proprio_data is None:
-            logger.warning(
-                f"No proprioception data for camera time at frame {frame_idx}"
-            )
+            logger.warning(f"No proprioception data for camera time at frame {frame_idx}")
             continue
 
         # Convert proprioception dict to arrays
@@ -757,13 +752,9 @@ def collect_aligned(config: CollectAlignedConfig) -> None:
     repo_id = get_repo_id(config)
     task_description = TASK_DESCRIPTIONS[config.task]
 
-    logger.info(
-        f"Starting aligned collection: task={config.task.value}, setup={config.setup.value}"
-    )
+    logger.info(f"Starting aligned collection: task={config.task.value}, setup={config.setup.value}")
     logger.info(f"Dataset: {repo_id}")
-    logger.info(
-        f"Dataset FPS: {config.dataset_fps}Hz, Proprioception FPS: {config.proprioception_fps}Hz"
-    )
+    logger.info(f"Dataset FPS: {config.dataset_fps}Hz, Proprioception FPS: {config.proprioception_fps}Hz")
     logger.info(f"Camera latency compensation: {config.camera_latency_ms}ms")
 
     # Create hardware
@@ -843,17 +834,13 @@ def collect_aligned(config: CollectAlignedConfig) -> None:
                 # Write to dataset
                 flush_to_dataset(aligned_frames, dataset)
                 recorded_episodes += 1
-                logger.info(
-                    f"Episode {episode_num} saved ({len(aligned_frames)} frames)"
-                )
+                logger.info(f"Episode {episode_num} saved ({len(aligned_frames)} frames)")
             else:
                 logger.warning("Episode had no aligned frames, discarding")
 
             # Reset time
             if recorded_episodes < config.num_episodes and not events["stop_recording"]:
-                log_say(
-                    f"Reset environment ({config.reset_time_s}s)", config.play_sounds
-                )
+                log_say(f"Reset environment ({config.reset_time_s}s)", config.play_sounds)
                 reset_start = time.perf_counter()
                 while time.perf_counter() - reset_start < config.reset_time_s:
                     if events["exit_early"]:
