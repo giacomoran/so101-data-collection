@@ -16,6 +16,8 @@ Training/inference consistency:
 - At inference time, we use the commanded action from the active chunk as proprio_obs
   (instead of the real robot position) to match training semantics
 - For the first chunk (no active chunk), we fall back to real robot position
+- Execution latency is compensated by indexing chunks in execution time and sending
+  actions ahead by the measured latency
 
 Key differences from eval_async_discard.py:
 - Action prefix is passed to the policy during inference
@@ -38,6 +40,7 @@ Usage:
         --policy.path=outputs/model_with_rtc/pretrained_model \
         --dataset_repo_id=giacomoran/cube_hand_guided \
         --fps=30 \
+        --timesteps_execution_latency=3 \
         --display_data=true
 """
 
@@ -100,9 +103,14 @@ class EvalAsyncRTCConfig:
     # Override n_action_steps from policy config (None = use policy default)
     n_action_steps: int | None = None
 
+    # Execution latency in control frames (e.g., 3 frames at 30fps ~ 100ms)
+    timesteps_execution_latency: int = 0
+
     # Remaining actions threshold: trigger inference when remaining actions drops below this
-    # Should be higher than inference delay + execution horizon to ensure new chunk is ready
-    # e.g., if inference takes ~200ms (6 timesteps at 30fps) and threshold is 8, we have 2 timesteps buffer
+    # Should be higher than inference latency + execution latency (in frames)
+    # to ensure new chunk is ready before we need to send actions for future exec times.
+    # e.g., if inference takes ~200ms (6 frames at 30fps), execution latency is 3 frames,
+    # and threshold is 10, we have 1 frame buffer.
     threshold_remaining_actions: int = 8
 
     # Display and feedback
@@ -127,6 +135,8 @@ class EvalAsyncRTCConfig:
         # Validate fps_display_data is multiple of fps
         if self.fps_display_data % self.fps != 0:
             raise ValueError(f"fps_display_data ({self.fps_display_data}) must be a multiple of fps ({self.fps})")
+        if self.timesteps_execution_latency < 0:
+            raise ValueError("timesteps_execution_latency must be >= 0")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -142,6 +152,10 @@ class EvalAsyncRTCConfig:
 @dataclass
 class ActionChunk:
     """A chunk of actions with associated timing information.
+
+    Timesteps are in execution time (aligned with observations). The actor sends
+    actions for (timestep + latency_frames) each control frame to compensate for
+    robot latency, so actions execute at the intended timestep.
 
     Actions are stored as ABSOLUTE joint positions (ready to send to robot).
     The proprio_obs field records the reference state used to convert relative
@@ -160,10 +174,9 @@ class ActionChunk:
     In the ACTRelativeRTC policy:
     - Both at training and inference time, the encoder input is only the
       observation images (not proprioception). Proprioception (proprio_obs) is
-      only used for computing relative actions. However, there's a semantic
-      difference: at training time proprio_obs[t] = action[t] (hand-guided setup,
-      same arm), while at inference time proprio_obs is the actual robot position
-      which may differ from the commanded action.
+      only used for computing relative actions. At inference time we use the
+      commanded action for the current execution timestep (matching training),
+      falling back to the measured robot position only when no action is available.
     - The predicted action chunk corresponds to timesteps:
       `[timestep_obs + 1 + delay, timestep_obs + 1 + delay + chunk_size)`.
       The `+ 1` is there because in the hand-guided setup action[t] = proprio_obs[t]
@@ -172,7 +185,7 @@ class ActionChunk:
     Attributes:
         actions: Action tensor [n_actions, action_dim] as ABSOLUTE joint positions
         proprio_obs: Observation state tensor [1, state_dim] at inference time
-        timestep_obs: Reference timestep for action indexing
+        timestep_obs: Reference execution timestep for action indexing
         delay: Number of prefix steps used; actions[0] executes at timestep_obs + delay + 1
         idx_chunk: Inference counter that generated this chunk (for logging)
     """
@@ -199,14 +212,13 @@ class ActionChunk:
         return None
 
     def count_remaining_actions_from(self, timestep: int) -> int:
-        """Get number of actions remaining from the given timestep (exclusive).
+        """Get number of actions remaining after the given timestep.
 
         Args:
             timestep: Timestep to check from
 
         Returns:
-            Number of actions that will execute at or after this timestep,
-            including the action at `timestep` itself if it exists
+            Number of actions that will execute at timesteps > `timestep`
         """
         timestep_first_action = self.timestep_obs + self.delay + 1
         idx = timestep + 1 - timestep_first_action
@@ -219,6 +231,7 @@ class ActionChunk:
         timestep_obs + 1 (action[timestep_obs] is skipped because relative_action
         at timestep_obs = 0 in the hand-guided setup). At inference, we match this
         convention: the prefix starts from timestep + 1, not timestep.
+        The timestep is in execution-time coordinates (aligned with observations).
 
         Args:
             timestep: Current timestep (new observation time). Prefix will contain
@@ -256,16 +269,16 @@ class State:
     # Note: Using Optional[Lock] instead of Lock | None to avoid dataclass issues
     lock: Optional[Lock] = None
 
-    # Current timestep (updated by actor each control frame)
+    # Current execution timestep (updated by actor each control frame)
     timestep: int = 0
 
     # Current observation (updated by actor each control frame)
     dict_obs: dict | None = None
 
-    # Active chunk being executed by actor (used by inference for prefix)
+    # Active chunk for current execution time (used by inference for prefix)
     action_chunk_active: ActionChunk | None = None
 
-    # Pending chunk from inference thread (switched to by actor)
+    # Pending chunk from inference thread (future execution times)
     action_chunk_pending: ActionChunk | None = None
 
     # Inference request state
@@ -313,6 +326,10 @@ def thread_actor_fn(
 ) -> None:
     """Actor thread: executes actions from current chunk at target fps.
 
+    Execution latency compensation: action chunks are indexed by execution time
+    (aligned with observations). At control timestep t, we send action for
+    timestep_exec = t + latency_frames so it executes at the intended time.
+
     This thread:
     1. Get observation from robot
     2. Acquire lock
@@ -335,6 +352,9 @@ def thread_actor_fn(
     count_executed_actions = 0
     action_chunk_active: ActionChunk | None = None
 
+    # Execution latency compensation (in control frames)
+    timesteps_execution_latency = cfg.timesteps_execution_latency
+
     # Compute frame skip ratio: how many display frames per control frame
     num_frames_per_control_frame = cfg.fps_display_data // cfg.fps
 
@@ -342,7 +362,7 @@ def thread_actor_fn(
     robot_action_last_executed = None
 
     try:
-        timestep = 0  # Timestep is effectively the idx of control frames
+        timestep = 0  # Execution-time index (aligned with observations)
         idx_frame = 0
         while not state.event_shutdown.is_set():
             ts_start_frame = time.perf_counter()
@@ -356,13 +376,15 @@ def thread_actor_fn(
             if is_control_frame:
                 # Control pipeline: update state, check chunks, pick action, trigger inference
 
+                timestep_exec = timestep + timesteps_execution_latency
+
                 # 2. Acquire lock
                 with state.lock:
                     # 3. Update state with observation
                     state.timestep = timestep
                     state.dict_obs = dict_obs.copy()
 
-                    # 4. Check for pending chunk
+                    # 4. Check for pending chunk (promote when it covers current execution timestep)
                     if state.action_chunk_pending:
                         action_chunk_pending = state.action_chunk_pending
                         if action_chunk_pending.action_at(timestep) is not None:
@@ -376,25 +398,45 @@ def thread_actor_fn(
                                     f"timestep_action_start={1 + action_chunk_active.delay + action_chunk_active.timestep_obs})"
                                 )
 
-                    # 5. Pick action
+                    # 5. Pick action for execution time (timestep_exec)
+                    # action_chunk_active covers current execution time (timestep);
+                    # action_chunk_for_exec provides the future action we must command now.
                     action = None
-                    if action_chunk_active is not None:
-                        action = action_chunk_active.action_at(timestep)
+                    action_chunk_for_exec = None
+                    # Prefer pending chunk once its scheduled start is reached (RTC switch point),
+                    # even if the active chunk still overlaps that time.
+                    if state.action_chunk_pending is not None:
+                        action = state.action_chunk_pending.action_at(timestep_exec)
+                        if action is not None:
+                            action_chunk_for_exec = state.action_chunk_pending
+
+                    if action is None and action_chunk_active is not None:
+                        action = action_chunk_active.action_at(timestep_exec)
+                        if action is not None:
+                            action_chunk_for_exec = action_chunk_active
 
                     # 6. Trigger inference (only if no pending chunk waiting to be switched to)
                     # Capture timestep and observation now so inference uses consistent timing
                     # (see State docstring for why this matters)
-                    count_remaining_actions = (
-                        action_chunk_active.count_remaining_actions_from(timestep) if action_chunk_active else 0
+                    count_remaining_actions = None
+                    if action_chunk_for_exec is not None:
+                        count_remaining_actions = action_chunk_for_exec.count_remaining_actions_from(timestep_exec)
+
+                    can_request_inference = (
+                        state.timestep_inference_requested is None and state.action_chunk_pending is None
                     )
-                    if (
-                        state.timestep_inference_requested is None  # no inference running
-                        and state.action_chunk_pending is None
-                        and count_remaining_actions <= cfg.threshold_remaining_actions
-                    ):
+                    has_exec_action = action_chunk_for_exec is not None
+                    below_threshold = has_exec_action and count_remaining_actions <= cfg.threshold_remaining_actions
+                    should_request_inference = can_request_inference and (not has_exec_action or below_threshold)
+
+                    if should_request_inference:
                         state.timestep_inference_requested = timestep
                         state.dict_obs_inference_requested = dict_obs.copy()
                         state.event_inference_requested.set()
+
+                    idx_chunk_active = action_chunk_active.idx_chunk if action_chunk_active else -1
+                    idx_chunk_exec = action_chunk_for_exec.idx_chunk if action_chunk_for_exec else -1
+                    idx_chunk_pending = state.action_chunk_pending.idx_chunk if state.action_chunk_pending else -1
 
                 # 7. Release lock
 
@@ -410,17 +452,20 @@ def thread_actor_fn(
                     # Store last sent action for display
                     robot_action_last_executed = robot_action
 
-                # Increment timestep only on control frames
-                timestep += 1
-
-                # Get chunk index for logging
-                idx_chunk = action_chunk_active.idx_chunk if action_chunk_active else -1
-                count_remaining_actions = count_remaining_actions if count_remaining_actions else -1
+                # Get chunk index for logging and rerun
+                idx_chunk = idx_chunk_exec
+                count_remaining_actions_log = count_remaining_actions if count_remaining_actions is not None else -1
 
                 if cfg.debug_timing:
                     logging.info(
-                        f"[ACTOR] timestep={timestep} | chunk={idx_chunk} | count_remaining_actions={count_remaining_actions} | count_executed_actions={count_executed_actions}"
+                        f"[ACTOR] timestep={timestep} | timestep_exec={timestep_exec} | "
+                        f"chunk_active={idx_chunk_active} | chunk_exec={idx_chunk_exec} | "
+                        f"chunk_pending={idx_chunk_pending} | remaining_after_exec={count_remaining_actions_log} | "
+                        f"count_executed_actions={count_executed_actions}"
                     )
+
+                # Increment timestep only on control frames
+                timestep += 1
             else:
                 # Non-control frame: just get obs and log to rerun
                 pass
@@ -468,6 +513,9 @@ def thread_inference_fn(
 ) -> None:
     """Inference thread: waits for signal, runs inference with RTC, creates new action chunk.
 
+    Timesteps are in execution-time coordinates (aligned with observations). The
+    prefix describes actions that will execute before the new chunk starts.
+
     This thread:
     1. Waits for event_inference_requested event from actor
     2. Gets latest observation and active chunk from shared state
@@ -481,6 +529,8 @@ def thread_inference_fn(
 
     # Get RTC max delay from policy config (0 if not supported)
     rtc_max_delay = getattr(policy.config, "rtc_max_delay", 0)
+    timesteps_execution_latency = cfg.timesteps_execution_latency
+    warned_latency_prefix = False
 
     try:
         while not state.event_shutdown.is_set():
@@ -520,6 +570,19 @@ def thread_inference_fn(
                     print("wrong")
                 # Compute prefix from active chunk
                 action_prefix_absolute, delay = action_chunk_active.action_prefix_at(timestep, rtc_max_delay)
+                if (
+                    timesteps_execution_latency > 0
+                    and delay < timesteps_execution_latency
+                    and not warned_latency_prefix
+                ):
+                    logging.warning(
+                        "RTC delay (%d) is shorter than execution latency (%d frames). "
+                        "Some in-flight actions may not be covered by the prefix. "
+                        "Consider increasing threshold_remaining_actions or rtc_max_delay.",
+                        delay,
+                        timesteps_execution_latency,
+                    )
+                    warned_latency_prefix = True
             else:
                 # First chunk: no active chunk yet, use real robot position
                 array_proprio_obs = [dict_obs[motor_name] for motor_name in motor_names]
@@ -657,6 +720,14 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
         logging.warning("Policy rtc_max_delay=0, running without RTC prefix conditioning.")
     else:
         logging.info(f"Policy RTC max delay: {rtc_max_delay}")
+    timesteps_execution_latency = cfg.timesteps_execution_latency
+    if timesteps_execution_latency > 0 and rtc_max_delay < timesteps_execution_latency:
+        logging.warning(
+            "Execution latency is %d frames but policy rtc_max_delay is %d. "
+            "Prefix may not cover all in-flight actions.",
+            timesteps_execution_latency,
+            rtc_max_delay,
+        )
 
     # Override device processor to use the detected device (cuda/cpu/mps)
     preprocessor_overrides = {
@@ -698,6 +769,7 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
         log_say("Starting evaluation", cfg.play_sounds)
 
         logging.info(f"Starting episode (max {cfg.episode_time_s}s at {cfg.fps} fps)")
+        logging.info(f"Execution latency: {cfg.timesteps_execution_latency} frames")
         logging.info(f"Remaining actions threshold: {cfg.threshold_remaining_actions}")
 
         # Reset policy and processors
@@ -843,8 +915,17 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
                     f"std={latency_stats['std']:.1f}ms, p95={latency_stats['p95']:.1f}ms"
                 )
 
-        # Cleanup
+        # Run homing sequence to safely park the arm before disconnecting
         if robot and robot.is_connected:
+            logging.info("Running homing sequence...")
+            try:
+                # Lazy import to avoid potential import-time side effects
+                from so101_data_collection.zxtra.homing import run_homing_sequence
+
+                run_homing_sequence(robot, enable_rerun_logging=False)
+            except Exception as e:
+                logging.error(f"Homing failed: {e}")
+
             logging.info("Disconnecting robot...")
             robot.disconnect()
 
