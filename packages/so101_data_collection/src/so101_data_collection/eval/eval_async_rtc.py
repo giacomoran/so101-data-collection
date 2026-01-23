@@ -12,10 +12,11 @@ Uses act_relative_rtc_2 policy which:
 - Handles absolute-to-relative prefix conversion internally in predict_action_chunk
 
 Training/inference consistency:
-- At training time, proprio_obs[t] = action[t] (hand-guided setup, same arm)
-- At inference time, we use the commanded action from the active chunk as proprio_obs
-  (instead of the real robot position) to match training semantics
-- For the first chunk (no active chunk), we fall back to real robot position
+- At training time, proprio_obs[t] = action[t] (hand-guided setup, same arm). The model
+  uses obs_state_t (actual observation) as reference for computing relative actions.
+- At inference time, we use the actual robot observation as proprio_obs, matching how
+  obs_state_t is used during training. The obs == action property is naturally maintained
+  when the robot tracks commanded positions well (enabled by execution latency compensation).
 - Execution latency is compensated by indexing chunks in execution time and sending
   actions ahead by the measured latency
 
@@ -174,9 +175,7 @@ class ActionChunk:
     In the ACTRelativeRTC policy:
     - Both at training and inference time, the encoder input is only the
       observation images (not proprioception). Proprioception (proprio_obs) is
-      only used for computing relative actions. At inference time we use the
-      commanded action for the current execution timestep (matching training),
-      falling back to the measured robot position only when no action is available.
+      only used for computing relative actions.
     - The predicted action chunk corresponds to timesteps:
       `[timestep_obs + 1 + delay, timestep_obs + 1 + delay + chunk_size)`.
       The `+ 1` is there because in the hand-guided setup action[t] = proprio_obs[t]
@@ -184,7 +183,7 @@ class ActionChunk:
 
     Attributes:
         actions: Action tensor [n_actions, action_dim] as ABSOLUTE joint positions
-        proprio_obs: Observation state tensor [1, state_dim] at inference time
+        proprio_obs: Actual robot observation [1, state_dim] at inference time
         timestep_obs: Reference execution timestep for action indexing
         delay: Number of prefix steps used; actions[0] executes at timestep_obs + delay + 1
         idx_chunk: Inference counter that generated this chunk (for logging)
@@ -552,23 +551,15 @@ def thread_inference_fn(
                     state.dict_obs_inference_requested = None
                     continue
 
-            # Compute proprio_obs and prefix from active chunk
-            # For consistency with training (where proprio_obs[t] = action[t] in hand-guided setup),
-            # we use the commanded action from the active chunk instead of the real robot position.
-            # This ensures the reference point for relative actions matches training semantics.
+            # Always use actual robot observation as proprio_obs (matches training).
+            # During training, obs_state_t is the actual robot observation, and relative
+            # actions are computed as (action - obs_state_t). The fact that obs == action
+            # in hand-guided data is a property of the data, not a model requirement.
+            array_proprio_obs = [dict_obs[motor_name] for motor_name in motor_names]
+            proprio_obs = torch.tensor(np.array(array_proprio_obs, dtype=np.float32), device=device).unsqueeze(0)
+
+            # Compute prefix from active chunk (if any)
             if action_chunk_active is not None:
-                action_at_timestep = action_chunk_active.action_at(timestep)
-                if action_at_timestep is not None:
-                    # Use commanded action as proprio_obs (matches training: proprio_obs = action)
-                    proprio_obs = action_at_timestep.unsqueeze(0)  # [1, action_dim]
-                else:
-                    # Fallback to real robot position if no action at this timestep
-                    array_proprio_obs = [dict_obs[motor_name] for motor_name in motor_names]
-                    proprio_obs = torch.tensor(np.array(array_proprio_obs, dtype=np.float32), device=device).unsqueeze(
-                        0
-                    )
-                    print("wrong")
-                # Compute prefix from active chunk
                 action_prefix_absolute, delay = action_chunk_active.action_prefix_at(timestep, rtc_max_delay)
                 if (
                     timesteps_execution_latency > 0
@@ -584,9 +575,6 @@ def thread_inference_fn(
                     )
                     warned_latency_prefix = True
             else:
-                # First chunk: no active chunk yet, use real robot position
-                array_proprio_obs = [dict_obs[motor_name] for motor_name in motor_names]
-                proprio_obs = torch.tensor(np.array(array_proprio_obs, dtype=np.float32), device=device).unsqueeze(0)
                 action_prefix_absolute = None
                 delay = 0
 
