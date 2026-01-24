@@ -77,6 +77,7 @@ from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say
 from lerobot.utils.visualization_utils import init_rerun
 from lerobot_policy_act_relative_rtc_2 import ACTRelativeRTCConfig  # noqa: F401
 
+from so101_data_collection.eval.debug_save_images import InferenceImageSaver
 from so101_data_collection.eval.rerun_utils import (
     log_rerun_data,
 )
@@ -121,6 +122,10 @@ class EvalAsyncRTCConfig:
 
     # Debug options
     debug_timing: bool = False
+
+    # Debug: save inference images for comparison with training
+    debug_save_images: bool = False
+    path_debug_images: str = "outputs/debug_inference_images"
 
     def __post_init__(self):
         # Parse policy path from CLI if provided
@@ -509,6 +514,7 @@ def thread_inference_fn(
     camera_names: list[str],
     tracker_latency: LatencyTracker,
     robot_type: str,
+    image_saver: InferenceImageSaver | None,
 ) -> None:
     """Inference thread: waits for signal, runs inference with RTC, creates new action chunk.
 
@@ -597,6 +603,10 @@ def thread_inference_fn(
                 # Prepare observation and apply preprocessor (for images)
                 observation = prepare_observation_for_inference(observation_frame, device, None, robot_type)
                 observation = preprocessor(observation)
+
+                # Save images for debugging (before model forward pass)
+                if image_saver is not None:
+                    image_saver.save(idx_chunk, dict_obs, observation, camera_names)
 
                 # Create inference batch with observation state from actor
                 # predict_action_chunk uses proprio_obs for prefix conversion (raw, not normalized)
@@ -792,6 +802,15 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
         policy_n_action_steps = getattr(policy.config, "n_action_steps", 1)
         n_action_steps = cfg.n_action_steps if cfg.n_action_steps is not None else policy_n_action_steps
 
+        # Create image saver for debugging (if enabled)
+        image_saver = None
+        if cfg.debug_save_images:
+            # Extract mean/std from dataset stats for denormalization
+            key_image = f"observation.images.{camera_names[0]}"
+            mean = ds_meta.stats[key_image]["mean"].tolist()
+            std = ds_meta.stats[key_image]["std"].tolist()
+            image_saver = InferenceImageSaver(cfg.path_debug_images, mean=mean, std=std)
+
         # Start inference thread
         thread_inference = Thread(
             target=thread_inference_fn,
@@ -806,6 +825,7 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
                 camera_names,
                 latency_tracker,
                 robot_type,
+                image_saver,
             ),
             daemon=True,
             name="Inference",

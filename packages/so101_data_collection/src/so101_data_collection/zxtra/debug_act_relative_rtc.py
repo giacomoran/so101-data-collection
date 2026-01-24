@@ -10,8 +10,10 @@ Or with debugger:
 
 from pathlib import Path
 
+import numpy as np
 import torch
 from icecream import ic
+from PIL import Image
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.utils.random_utils import set_seed
@@ -27,6 +29,8 @@ SEED = 1007
 BATCH_SIZE = 2
 DEVICE = "cpu"
 NUM_WORKERS = 0  # Easier debugging
+SAVE_IMAGES = True  # Save training images to outputs/debug_training_images
+PATH_DEBUG_IMAGES = Path("outputs/debug_training_images")
 
 
 def main():
@@ -88,6 +92,7 @@ def main():
         DATASET_REPO_ID,
         root=DATASET_ROOT,
         delta_timestamps=delta_timestamps,
+        video_backend="pyav",
     )
     ic(len(dataset))
 
@@ -123,6 +128,31 @@ def main():
     ic(batch["observation.images.wrist"].shape)
     ic(batch["action"].shape)
     ic(batch["action_is_pad"].shape)
+
+    # Save training images for debugging
+    if SAVE_IMAGES:
+        PATH_DEBUG_IMAGES.mkdir(parents=True, exist_ok=True)
+        ic(f"Saving training images to {PATH_DEBUG_IMAGES}")
+
+        # Images from dataset are [B, T, C, H, W] normalized to [0, 1]
+        images = batch["observation.images.wrist"]  # [B, T, C, H, W]
+        for b in range(images.shape[0]):
+            for t in range(images.shape[1]):
+                img_tensor = images[b, t]  # [C, H, W] in [0, 1]
+
+                # Save as-is (dataset provides images in [0, 1])
+                img_np = (img_tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                Image.fromarray(img_np).save(PATH_DEBUG_IMAGES / f"batch{b}_t{t}_raw.png")
+
+                # Also save with ImageNet denormalization for comparison
+                # (in case the dataset stores normalized images)
+                mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                img_denorm = img_tensor * std + mean
+                img_denorm_np = (img_denorm.clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                Image.fromarray(img_denorm_np).save(PATH_DEBUG_IMAGES / f"batch{b}_t{t}_denorm.png")
+
+        ic(f"Saved {images.shape[0] * images.shape[1]} images")
 
     # === TRAINING FORWARD PASS ===
     ic("Running forward pass (training)")
