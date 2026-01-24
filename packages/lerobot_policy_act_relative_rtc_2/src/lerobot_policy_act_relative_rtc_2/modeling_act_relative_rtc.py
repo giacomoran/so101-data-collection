@@ -54,6 +54,9 @@ from .configuration_act_relative_rtc import ACTRelativeRTCConfig
 # Custom constant for RTC delays (not in lerobot.utils.constants)
 DELAYS = "delays"
 
+# Joint names for SO101 robot arm (used for loss_weights_joint config)
+JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+
 
 class Normalizer(nn.Module):
     """Affine normalization module with persistent mean/std buffers.
@@ -512,6 +515,20 @@ class ACTRelativeRTCPolicy(PreTrainedPolicy):
         # Compute L1 loss on targets (excluding padded actions)
         pad_mask = ~action_is_pad.unsqueeze(-1)
         l1_loss_full = F.l1_loss(targets, pred_relative_actions, reduction="none")
+
+        # Apply per-joint loss weights if configured (dict format: {"gripper": 3.0})
+        if self.config.loss_weights_joint is not None:
+            weights_list = [self.config.loss_weights_joint.get(name, 1.0) for name in JOINT_NAMES]
+            joint_weights = torch.tensor(
+                weights_list,
+                dtype=l1_loss_full.dtype,
+                device=l1_loss_full.device,
+            )
+            # l1_loss_full: [B, D, chunk_size, action_dim]
+            # joint_weights: [action_dim]
+            # Broadcasting: weights applied to last dim, same weight for all batches/delays/timesteps
+            l1_loss_full = l1_loss_full * joint_weights
+
         l1_loss = (l1_loss_full * pad_mask).mean()
         loss_dict = {"l1_loss": l1_loss.item()}
 

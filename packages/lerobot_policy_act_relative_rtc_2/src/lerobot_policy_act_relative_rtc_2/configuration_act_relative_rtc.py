@@ -135,6 +135,13 @@ class ACTRelativeRTCConfig(PreTrainedConfig):
     dropout: float = 0.1
     kl_weight: float = 10.0
 
+    # Per-joint loss weights for emphasizing specific joints (e.g., gripper).
+    # Dict mapping joint name to weight. Unspecified joints default to 1.0.
+    # Example: {"gripper": 3.0} gives gripper 3x weight.
+    # Joint names for SO101: shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper
+    # This is equivalent to dividing that joint's std by 1/weight in normalization.
+    loss_weights_joint: dict[str, float] | None = None
+
     # Training preset
     optimizer_lr: float = 1e-5
     optimizer_weight_decay: float = 1e-4
