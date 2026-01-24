@@ -69,8 +69,7 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
     keys_image: list[str] = field(default_factory=list)
     downscale_img_square: int | None = None  # Backward compatibility
 
-    # Cached resize parameters (computed on first call)
-    _hw_resize: tuple[int, int] | None = None
+    # Cached padding parameters (computed on first call)
     _padding: tuple[int, int, int, int] | None = None
 
     def __post_init__(self):
@@ -92,21 +91,31 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
             else:
                 _, C, H, W = shape_original
 
-            # Cache resize parameters on first call
-            if self._hw_resize is None:
-                scale = self.target_resolution / max(H, W)
-                h_new, w_new = int(H * scale), int(W * scale)
-                self._hw_resize = (h_new, w_new)
-
-                h_pad = self.target_resolution - h_new
-                w_pad = self.target_resolution - w_new
+            # Cache padding parameters on first call
+            # Order: pad to square FIRST, then scale (matches ffmpeg preprocessing)
+            if self._padding is None:
+                max_dim = max(H, W)
+                h_pad = max_dim - H
+                w_pad = max_dim - W
+                # torchvision.transforms.functional.pad uses (left, top, right, bottom)
                 self._padding = (w_pad // 2, h_pad // 2, w_pad - w_pad // 2, h_pad - h_pad // 2)
 
-            # Resize (preserving aspect ratio)
-            image = torch.nn.functional.interpolate(image, size=self._hw_resize, mode="bilinear", align_corners=False)
-
-            # Pad to square
+            # Pad to square first (matches ffmpeg: pad=max(iw,ih):max(iw,ih):...)
             image = F.pad(image, self._padding, fill=0, padding_mode="constant")
+
+            # Then scale to target resolution (matches ffmpeg: scale=target:target)
+            # Use mode="area" for better ffmpeg matching. On MPS, area mode has a limitation
+            # (input must be divisible by output), so we transfer to CPU for that operation.
+            if image.device.type == "mps":
+                image_cpu = image.cpu()
+                image_cpu = torch.nn.functional.interpolate(
+                    image_cpu, size=(self.target_resolution, self.target_resolution), mode="area"
+                )
+                image = image_cpu.to("mps")
+            else:
+                image = torch.nn.functional.interpolate(
+                    image, size=(self.target_resolution, self.target_resolution), mode="area"
+                )
 
             # Restore 5D shape if needed
             if len(shape_original) == 5:
@@ -192,29 +201,34 @@ def make_act_relative_rtc_2_pre_post_processors(
 
     assert config.device is not None
 
+    # Only add image resize step if images actually need resizing.
+    # Skip if: downscale_img_square is None, or images are already at target resolution.
+    keys_image = _get_keys_image_needing_resize(config)
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
+    ]
+
+    # IMPORTANT: Pad/resize BEFORE normalization so that fill=0 gives true black pixels.
+    # If we pad after normalization, fill=0 would be wrong (black in normalized space is ~-2.1).
+    if keys_image:
+        input_steps.append(
+            ImagePadSquareResizeProcessorStep(
+                target_resolution=config.downscale_img_square,
+                keys_image=keys_image,
+            ),
+        )
+
+    input_steps.append(
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
             device=config.device,
         ),
-    ]
-
-    # Only add image resize step if images actually need resizing.
-    # Skip if: downscale_img_square is None, or images are already at target resolution.
-    keys_image = _get_keys_image_needing_resize(config)
-    if keys_image:
-        input_steps.insert(
-            4,  # After DeviceProcessorStep (adjusted index due to drop step above)
-            ImagePadSquareResizeProcessorStep(
-                target_resolution=config.downscale_img_square,
-                keys_image=keys_image,
-            ),
-        )
+    )
 
     output_steps = [
         UnnormalizerProcessorStep(
