@@ -83,6 +83,7 @@ from so101_data_collection.eval.rerun_utils import (
 )
 from so101_data_collection.eval.trackers import LatencyTracker
 
+
 # ============================================================================
 # Configuration
 # ============================================================================

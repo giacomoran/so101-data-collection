@@ -91,6 +91,11 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
             else:
                 _, C, H, W = shape_original
 
+            # Short-circuit if already at target resolution (avoids CPU work during training
+            # when dataset images are already preprocessed to target size)
+            if H == self.target_resolution and W == self.target_resolution:
+                continue
+
             # Cache padding parameters on first call
             # Order: pad to square FIRST, then scale (matches ffmpeg preprocessing)
             if self._padding is None:
@@ -144,38 +149,6 @@ class ImagePadSquareResizeProcessorStep(ObservationProcessorStep):
         return features
 
 
-def _get_keys_image_needing_resize(
-    config: ACTRelativeRTCConfig,
-) -> list[str]:
-    """Get list of image keys that need resizing.
-
-    Returns empty list if:
-    - downscale_img_square is None
-    - All images are already at target resolution
-
-    Args:
-        config: Policy config with input_features and downscale_img_square.
-
-    Returns:
-        List of image feature keys that need resizing.
-    """
-    if config.downscale_img_square is None:
-        return []
-
-    target = config.downscale_img_square
-    keys_needing_resize = []
-
-    for key, feature in config.input_features.items():
-        if "image" not in key:
-            continue
-        # Feature shape is (C, H, W)
-        _, H, W = feature.shape
-        if H != target or W != target:
-            keys_needing_resize.append(key)
-
-    return keys_needing_resize
-
-
 def make_act_relative_rtc_2_pre_post_processors(
     config: ACTRelativeRTCConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
@@ -201,19 +174,17 @@ def make_act_relative_rtc_2_pre_post_processors(
 
     assert config.device is not None
 
-    # Only add image resize step if images actually need resizing.
-    # Skip if: downscale_img_square is None, or images are already at target resolution.
-    keys_image = _get_keys_image_needing_resize(config)
-
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         DeviceProcessorStep(device=config.device),
     ]
 
+    # Add resize step if downscale_img_square is set.
+    # The step short-circuits when images are already at target resolution (no CPU overhead).
     # IMPORTANT: Pad/resize BEFORE normalization so that fill=0 gives true black pixels.
-    # If we pad after normalization, fill=0 would be wrong (black in normalized space is ~-2.1).
-    if keys_image:
+    if config.downscale_img_square is not None:
+        keys_image = [k for k in config.input_features if "image" in k]
         input_steps.append(
             ImagePadSquareResizeProcessorStep(
                 target_resolution=config.downscale_img_square,
