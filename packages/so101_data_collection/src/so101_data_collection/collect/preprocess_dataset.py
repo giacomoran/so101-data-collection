@@ -3,23 +3,20 @@
 
 This tool prepares datasets for training by:
 1. Precomputing relative stats (delta_obs, relative_action) and storing in meta/relative_stats.json
-2. Preprocessing images to target resolution (pad to square + resize) using ffmpeg
-
-This eliminates runtime overhead from:
-- ~2min relative stats computation at every training init
-- GPU utilization issues from runtime image resizing
+2. Optionally preprocessing images to target resolution (pad to square + resize) using ffmpeg
 
 Usage:
-    # Full preprocessing (create new dataset with resized videos + relative stats)
+    # Full preprocessing (copy + resize videos + compute relative stats)
     python -m so101_data_collection.collect.preprocess_dataset \
         --repo-id giacomoran/so101_data_collection_cube_hand_guided \
         --output-repo-id giacomoran/cube_hand_guided_224 \
         --target-resolution 224
 
-    # Relative stats only (in-place, adds meta/relative_stats.json)
+    # Copy dataset without video resize (just copy + compute relative stats)
     python -m so101_data_collection.collect.preprocess_dataset \
         --repo-id giacomoran/so101_data_collection_cube_hand_guided \
-        --relative-stats-only
+        --output-repo-id giacomoran/cube_hand_guided_new_stats \
+        --skip-video-resize
 
     # Push to HuggingFace Hub
     python -m so101_data_collection.collect.preprocess_dataset \
@@ -54,13 +51,14 @@ class PreprocessConfig:
     """Configuration for dataset preprocessing."""
 
     repo_id: str
-    output_repo_id: str | None = None
+    output_repo_id: str
     target_resolution: int | None = None
-    relative_stats_only: bool = False
+    skip_video_resize: bool = False
     push_to_hub: bool = False
     skip_confirmation: bool = False
     obs_state_delta_frames: int = 1
-    chunk_size: int = 100
+    chunk_size: int = 8
+    rtc_max_delay: int = 3
     batch_size: int = 64
     num_workers: int = 4
 
@@ -71,9 +69,6 @@ def compute_and_save_relative_stats(
     config: PreprocessConfig,
 ) -> dict:
     """Compute relative stats and save to meta/relative_stats.json.
-
-    This reuses the logic from lerobot_policy_act_relative_rtc.relative_stats
-    but saves to a JSON file.
 
     Args:
         ds_meta: Dataset metadata.
@@ -88,9 +83,11 @@ def compute_and_save_relative_stats(
     logger.info("Computing relative stats...")
 
     # Build delta_timestamps for relative stats computation
+    # V2 policy uses action indices [1, ..., rtc_max_delay + chunk_size]
+    # (skips index 0 since action[t] ≈ obs[t] for relative actions)
     fps = ds_meta.fps
     delta_indices_state = [-config.obs_state_delta_frames, 0]
-    delta_indices_action = list(range(config.chunk_size))
+    delta_indices_action = list(range(1, config.rtc_max_delay + config.chunk_size + 1))
 
     delta_timestamps = {}
     for key in ds_meta.features:
@@ -129,6 +126,8 @@ def compute_and_save_relative_stats(
         "config": {
             "obs_state_delta_frames": config.obs_state_delta_frames,
             "chunk_size": config.chunk_size,
+            "rtc_max_delay": config.rtc_max_delay,
+            "action_delta_indices": delta_indices_action,
             "total_samples": len(dataset),
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
@@ -152,9 +151,6 @@ def resize_video_ffmpeg(
     target_resolution: int,
 ) -> None:
     """Resize a video using ffmpeg with pad-to-square then scale.
-
-    Uses ffmpeg's pad and scale filters directly on video files, which is
-    much faster than decoding frames, processing in Python, and re-encoding.
 
     Args:
         path_input: Path to input video file.
@@ -197,6 +193,36 @@ def resize_video_ffmpeg(
     if result.returncode != 0:
         logger.error(f"ffmpeg error: {result.stderr}")
         raise RuntimeError(f"ffmpeg failed to process {path_input}")
+
+
+def copy_dataset(
+    ds_meta: LeRobotDatasetMetadata,
+    path_output: Path,
+) -> None:
+    """Copy dataset to new location without modifying videos.
+
+    Args:
+        ds_meta: Source dataset metadata.
+        path_output: Output path for the new dataset.
+    """
+    path_source = Path(ds_meta.root)
+
+    logger.info(f"Copying dataset to {path_output}")
+
+    # Create output directory
+    path_output.mkdir(parents=True, exist_ok=True)
+
+    # Copy all files and directories
+    for item in path_source.iterdir():
+        path_dest = path_output / item.name
+        if item.is_dir():
+            if path_dest.exists():
+                shutil.rmtree(path_dest)
+            shutil.copytree(item, path_dest)
+            logger.info(f"Copied {item.name}/")
+        else:
+            shutil.copy2(item, path_dest)
+            logger.info(f"Copied {item.name}")
 
 
 def copy_and_resize_dataset(
@@ -284,17 +310,21 @@ def preprocess_dataset(config: PreprocessConfig) -> None:
     logger.info("Dataset Preprocessing for ACT Relative RTC")
     logger.info("=" * 80)
     logger.info(f"Source dataset: {config.repo_id}")
+    logger.info(f"Output dataset: {config.output_repo_id}")
 
-    if config.relative_stats_only:
-        logger.info("Mode: relative stats only (in-place)")
+    if config.skip_video_resize:
+        logger.info("Mode: copy + compute relative stats (no video resize)")
     else:
-        logger.info(f"Output dataset: {config.output_repo_id}")
+        logger.info("Mode: copy + resize videos + compute relative stats")
         logger.info(f"Target resolution: {config.target_resolution}")
 
     logger.info("")
 
-    # Load source dataset metadata
-    ds_meta = LeRobotDatasetMetadata(config.repo_id)
+    # Load source dataset (not just metadata) to ensure full download
+    # LeRobotDatasetMetadata only downloads meta/, but we need data/ and videos/ too
+    logger.info("Loading source dataset (this will download if not cached)...")
+    ds = LeRobotDataset(config.repo_id)
+    ds_meta = ds.meta
     logger.info(f"Dataset FPS: {ds_meta.fps}")
     logger.info(f"Total episodes: {ds_meta.total_episodes}")
     logger.info(f"Total frames: {ds_meta.total_frames}")
@@ -306,7 +336,10 @@ def preprocess_dataset(config: PreprocessConfig) -> None:
     logger.info("CRITICAL: Relative stats parameters (must match training config!)")
     logger.info("=" * 80)
     logger.info(f"  chunk_size:             {config.chunk_size}")
+    logger.info(f"  rtc_max_delay:          {config.rtc_max_delay}")
     logger.info(f"  obs_state_delta_frames: {config.obs_state_delta_frames}")
+    action_indices = list(range(1, config.rtc_max_delay + config.chunk_size + 1))
+    logger.info(f"  action_delta_indices:   [1, ..., {action_indices[-1]}] ({len(action_indices)} actions)")
     logger.info("")
     logger.info("These values MUST match your training configuration.")
     logger.info("Different values will produce incompatible relative stats.")
@@ -319,52 +352,57 @@ def preprocess_dataset(config: PreprocessConfig) -> None:
             return
         logger.info("")
 
-    if config.relative_stats_only:
-        # Just compute and save relative stats in-place
-        compute_and_save_relative_stats(
-            ds_meta,
-            Path(ds_meta.root),
-            config,
-        )
+    # Determine output path
+    path_source = Path(ds_meta.root)
+    path_output = path_source.parent.parent / config.output_repo_id
+
+    if config.skip_video_resize:
+        # Copy dataset without resizing videos
+        copy_dataset(ds_meta, path_output)
     else:
-        # Full preprocessing: copy dataset, resize videos, compute stats
-        if config.output_repo_id is None:
-            raise ValueError("--output-repo-id is required for full preprocessing")
-        if config.target_resolution is None:
-            raise ValueError("--target-resolution is required for full preprocessing")
-
-        # Determine output path
-        # Use same parent as source, with new repo_id
-        path_source = Path(ds_meta.root)
-        path_output = path_source.parent.parent / config.output_repo_id
-
         # Copy and resize dataset
         copy_and_resize_dataset(ds_meta, path_output, config.target_resolution)
 
-        # Compute and save relative stats in the new dataset
-        ds_meta_output = LeRobotDatasetMetadata(
-            config.output_repo_id,
-            root=path_output,
-        )
-        compute_and_save_relative_stats(
-            ds_meta_output,
-            path_output,
-            config,
-        )
+    # Compute and save relative stats
+    # NOTE: We use the SOURCE dataset metadata here because:
+    # 1. LeRobotDataset/LeRobotDatasetMetadata constructors try to fetch from
+    #    HuggingFace if local loading fails, and output_repo_id doesn't exist yet
+    # 2. Relative stats only depend on observation.state and action (not images),
+    #    so stats are identical regardless of video resize
+    # The stats are saved to the OUTPUT path (path_output)
+    compute_and_save_relative_stats(
+        ds_meta,  # Use source metadata (exists on HF/locally)
+        path_output,  # Save stats to output path
+        config,
+    )
 
+    logger.info("")
+    logger.info(f"Preprocessed dataset created at: {path_output}")
+
+    # Push to hub if requested
+    if config.push_to_hub:
         logger.info("")
-        logger.info(f"Preprocessed dataset created at: {path_output}")
+        logger.info("Pushing to HuggingFace Hub...")
+        # Bypass LeRobotDataset constructor (same HuggingFace fetch issue)
+        # Create minimal object with attributes needed for push_to_hub()
+        ds_meta_output = LeRobotDatasetMetadata.__new__(LeRobotDatasetMetadata)
+        ds_meta_output.repo_id = config.output_repo_id
+        ds_meta_output.root = path_output
+        ds_meta_output.revision = None
+        ds_meta_output.writer = None
+        ds_meta_output.latest_episode = None
+        ds_meta_output.metadata_buffer = []
+        ds_meta_output.metadata_buffer_size = 10
+        ds_meta_output.load_metadata()
 
-        # Push to hub if requested
-        if config.push_to_hub:
-            logger.info("")
-            logger.info("Pushing to HuggingFace Hub...")
-            dataset = LeRobotDataset(
-                config.output_repo_id,
-                root=path_output,
-            )
-            dataset.push_to_hub()
-            logger.info(f"Pushed to hub: {config.output_repo_id}")
+        dataset = LeRobotDataset.__new__(LeRobotDataset)
+        dataset.repo_id = config.output_repo_id
+        dataset.root = path_output
+        dataset.meta = ds_meta_output
+        dataset.revision = None
+
+        dataset.push_to_hub()
+        logger.info(f"Pushed to hub: {config.output_repo_id}")
 
     logger.info("")
     logger.info("Preprocessing complete!")
@@ -386,19 +424,19 @@ def parse_args() -> PreprocessConfig:
     parser.add_argument(
         "--output-repo-id",
         type=str,
-        default=None,
-        help="Output dataset repository ID (required unless --relative-stats-only)",
+        required=True,
+        help="Output dataset repository ID",
     )
     parser.add_argument(
         "--target-resolution",
         type=int,
         default=None,
-        help="Target square resolution for images (e.g., 224)",
+        help="Target square resolution for images (e.g., 224). Required unless --skip-video-resize.",
     )
     parser.add_argument(
-        "--relative-stats-only",
+        "--skip-video-resize",
         action="store_true",
-        help="Only compute relative stats (in-place, no video resizing)",
+        help="Copy dataset without resizing videos (just copy + compute relative stats)",
     )
     parser.add_argument(
         "--push-to-hub",
@@ -421,8 +459,14 @@ def parse_args() -> PreprocessConfig:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=100,
-        help="Action chunk size for relative stats computation",
+        default=8,
+        help="Action chunk size for relative stats computation (must match training config)",
+    )
+    parser.add_argument(
+        "--rtc-max-delay",
+        type=int,
+        default=3,
+        help="RTC max delay for action prefix conditioning (must match training config)",
     )
     parser.add_argument(
         "--batch-size",
@@ -440,21 +484,19 @@ def parse_args() -> PreprocessConfig:
     args = parser.parse_args()
 
     # Validation
-    if not args.relative_stats_only:
-        if args.output_repo_id is None:
-            parser.error("--output-repo-id is required unless --relative-stats-only")
-        if args.target_resolution is None:
-            parser.error("--target-resolution is required unless --relative-stats-only")
+    if not args.skip_video_resize and args.target_resolution is None:
+        parser.error("--target-resolution is required unless --skip-video-resize is set")
 
     return PreprocessConfig(
         repo_id=args.repo_id,
         output_repo_id=args.output_repo_id,
         target_resolution=args.target_resolution,
-        relative_stats_only=args.relative_stats_only,
+        skip_video_resize=args.skip_video_resize,
         push_to_hub=args.push_to_hub,
         skip_confirmation=args.skip_confirmation,
         obs_state_delta_frames=args.obs_state_delta_frames,
         chunk_size=args.chunk_size,
+        rtc_max_delay=args.rtc_max_delay,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )

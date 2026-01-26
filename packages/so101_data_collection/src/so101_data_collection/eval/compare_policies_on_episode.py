@@ -56,13 +56,9 @@ class ComparePoliciesConfig:
 
     def __post_init__(self):
         if not self.policy_paths:
-            raise ValueError(
-                "At least one policy path must be provided via --policy_paths"
-            )
+            raise ValueError("At least one policy path must be provided via --policy_paths")
         if not self.dataset_episode_idx:
-            raise ValueError(
-                "At least one episode index must be provided via --dataset_episode_idx"
-            )
+            raise ValueError("At least one episode index must be provided via --dataset_episode_idx")
 
 
 # ============================================================================
@@ -114,15 +110,20 @@ def load_policy_and_preprocessor(
 
         policy_type = config_dict.get("type", None)
         if policy_type is None:
-            raise ValueError(
-                f"Config from {pretrained_name_or_path} missing 'type' field"
-            )
+            raise ValueError(f"Config from {pretrained_name_or_path} missing 'type' field")
 
         pretrained_path = pretrained_name_or_path
 
     # Load policy
     if policy_type == "act_relative_rtc":
         from lerobot_policy_act_relative_rtc import ACTRelativeRTCPolicy
+
+        policy = ACTRelativeRTCPolicy.from_pretrained(
+            pretrained_path,
+            device=device,
+        )
+    elif policy_type == "act_relative_rtc_2":
+        from lerobot_policy_act_relative_rtc_2 import ACTRelativeRTCPolicy
 
         policy = ACTRelativeRTCPolicy.from_pretrained(
             pretrained_path,
@@ -155,9 +156,15 @@ def load_policy_and_preprocessor(
 
 
 def is_relative_action_policy(policy: PreTrainedPolicy) -> bool:
-    """Check if a policy uses relative action representation."""
+    """Check if a policy uses relative action representation (V1 or V2)."""
     policy_type = getattr(policy.config, "type", None) or policy.name
-    return policy_type in ("act_relative_rtc",)
+    return policy_type in ("act_relative_rtc", "act_relative_rtc_2")
+
+
+def is_relative_action_policy_v2(policy: PreTrainedPolicy) -> bool:
+    """Check if a policy is the V2 relative action policy (no delta_obs input)."""
+    policy_type = getattr(policy.config, "type", None) or policy.name
+    return policy_type == "act_relative_rtc_2"
 
 
 # ============================================================================
@@ -213,17 +220,13 @@ def predict_chunk_relative(
             gt_actions = sample["action"].cpu().numpy()
             prefix_len = min(rtc_delay, len(gt_actions))
             # Get absolute action prefix from ground truth
-            action_prefix_abs = (
-                torch.from_numpy(gt_actions[:prefix_len]).unsqueeze(0).to(device)
-            )
+            action_prefix_abs = torch.from_numpy(gt_actions[:prefix_len]).unsqueeze(0).to(device)
             # Convert to relative: action_prefix - state_t
             state_t_tensor = state_t.unsqueeze(0).to(device)
             action_prefix_relative = action_prefix_abs - state_t_tensor.unsqueeze(1)
             # Normalize if has_relative_stats
             if policy.has_relative_stats:
-                action_prefix_relative = policy.relative_action_normalizer(
-                    action_prefix_relative
-                )
+                action_prefix_relative = policy.relative_action_normalizer(action_prefix_relative)
             relative_actions = policy.predict_action_chunk(
                 batch, delay=prefix_len, action_prefix=action_prefix_relative
             )
@@ -238,6 +241,75 @@ def predict_chunk_relative(
     # Convert to absolute
     state_t_tensor = state_t.unsqueeze(0).to(device)
     absolute_actions = relative_actions + state_t_tensor
+
+    return absolute_actions[0].cpu().numpy(), inference_time
+
+
+# ============================================================================
+# Inference - Relative Policy V2 (ACTRelativeRTC2 - no delta_obs input)
+# ============================================================================
+
+
+def predict_chunk_relative_v2(
+    policy: PreTrainedPolicy,
+    preprocessor: PolicyProcessorPipeline,
+    sample: dict,
+    device: str,
+    rtc_delay: int = 0,
+) -> tuple[np.ndarray, float]:
+    """Predict absolute action chunk from ACTRelativeRTC2 policy (V2).
+
+    V2 differences from V1:
+    - Uses raw observation state as input (not delta_obs)
+    - No delta_obs_normalizer
+    - predict_action_chunk expects absolute action_prefix (converts internally)
+
+    Returns:
+        (absolute_actions, inference_time_seconds)
+    """
+    # Extract state at t from sample (V2 only needs current state, not delta)
+    obs_state_stacked = sample["observation.state"]
+    if obs_state_stacked.dim() == 2:
+        # [2, state_dim] -> take current state at t (index 1)
+        state_t = obs_state_stacked[1]
+    else:
+        state_t = obs_state_stacked
+
+    # Build observation batch (PyTorch tensors, images at t only)
+    batch = {"observation.state": state_t.unsqueeze(0).to(device)}
+    for key in sample:
+        if key.startswith("observation.images.") and not key.endswith("_is_pad"):
+            img = sample[key]
+            if img.ndim == 4:
+                img = img[1]  # Take image at t
+            batch[key] = img.unsqueeze(0).to(device)
+
+    # Apply preprocessor
+    batch = preprocessor(batch)
+
+    # Run inference
+    # Note: V2 always has RTC enabled (no use_rtc flag, just rtc_max_delay)
+    start_time = time.perf_counter()
+    with torch.no_grad():
+        if rtc_delay > 0:
+            gt_actions = sample["action"].cpu().numpy()
+            prefix_len = min(rtc_delay, len(gt_actions))
+            # Get absolute action prefix from ground truth
+            # V2: predict_action_chunk expects absolute action_prefix (converts internally)
+            action_prefix_abs = torch.from_numpy(gt_actions[:prefix_len]).unsqueeze(0).to(device)
+            relative_actions_normalized = policy.predict_action_chunk(
+                batch, delay=prefix_len, action_prefix=action_prefix_abs
+            )
+        else:
+            relative_actions_normalized = policy.predict_action_chunk(batch)
+    inference_time = time.perf_counter() - start_time
+
+    # Unnormalize relative actions
+    relative_actions = policy.relative_action_normalizer.inverse(relative_actions_normalized)
+
+    # Convert to absolute
+    state_t_tensor = state_t.unsqueeze(0).to(device)
+    absolute_actions = relative_actions + state_t_tensor.unsqueeze(1)
 
     return absolute_actions[0].cpu().numpy(), inference_time
 
@@ -372,11 +444,11 @@ def run_comparison_for_episode(
         }
 
     # Collect ground truth actions
+    # Note: dataset is loaded with episodes=[episode_idx], so indices are 0 to num_frames-1
     logging.info("Collecting ground truth actions...")
     gt_actions_list = []
     for local_idx in range(num_frames):
-        global_idx = from_idx + local_idx
-        sample = dataset[global_idx]
+        sample = dataset[local_idx]
         gt_chunk = sample["action"].cpu().numpy()
         gt_actions_list.append(gt_chunk[0])
 
@@ -391,15 +463,22 @@ def run_comparison_for_episode(
         policy.reset()
 
     for local_idx in range(num_frames):
-        global_idx = from_idx + local_idx
-        sample = dataset[global_idx]
+        sample = dataset[local_idx]
         gt_chunk = sample["action"].cpu().numpy()
 
-        for idx_policy, (policy, name, preprocessor) in enumerate(
-            zip(policies, policy_names, preprocessors)
-        ):
+        for idx_policy, (policy, name, preprocessor) in enumerate(zip(policies, policy_names, preprocessors)):
             # Call appropriate inference function based on policy type
-            if is_relative_action_policy(policy):
+            if is_relative_action_policy_v2(policy):
+                # V2: no delta_obs input, uses raw observation state
+                pred_chunk, inference_time = predict_chunk_relative_v2(
+                    policy,
+                    preprocessor,
+                    sample,
+                    cfg.device,
+                    rtc_delay=cfg.rtc_delay,
+                )
+            elif is_relative_action_policy(policy):
+                # V1: uses delta_obs as input
                 pred_chunk, inference_time = predict_chunk_relative(
                     policy,
                     preprocessor,
@@ -424,15 +503,11 @@ def run_comparison_for_episode(
             policy_predictions[name]["errors_over_time"].append(error.mean())
 
             for dim in range(action_dim):
-                policy_predictions[name]["per_dim_errors"][dim].append(
-                    error[:, dim].mean()
-                )
+                policy_predictions[name]["per_dim_errors"][dim].append(error[:, dim].mean())
 
             # Store chunks at each interval
             if local_idx % int(fps * cfg.plot_interval) == 0:
-                policy_predictions[name]["chunks"].append(
-                    (local_idx, pred_chunk.copy())
-                )
+                policy_predictions[name]["chunks"].append((local_idx, pred_chunk.copy()))
 
         if local_idx % 100 == 0:
             errors_str = ", ".join(
@@ -451,12 +526,8 @@ def run_comparison_for_episode(
         logging.info("-" * 40)
 
         inference_times = np.array(policy_predictions[name]["inference_times"])
-        logging.info(
-            f"  Latency: {inference_times.mean() * 1000:.2f}ms ± {inference_times.std() * 1000:.2f}ms"
-        )
-        logging.info(
-            f"  Effective Hz: {1.0 / inference_times.mean():.1f} Hz (target: {fps} Hz)"
-        )
+        logging.info(f"  Latency: {inference_times.mean() * 1000:.2f}ms ± {inference_times.std() * 1000:.2f}ms")
+        logging.info(f"  Effective Hz: {1.0 / inference_times.mean():.1f} Hz (target: {fps} Hz)")
 
         all_errors = np.array(policy_predictions[name]["errors_over_time"])
         logging.info(f"  Mean Error: {all_errors.mean():.4f} ± {all_errors.std():.4f}")
@@ -523,12 +594,9 @@ def create_comparison_plots(
         )
 
         for i, name in enumerate(policy_names):
-            short_name = name.split("/")[-1].split(" ")[0][:15]
+            short_name = name.split(" (")[0]  # Remove policy type suffix
             for start_frame, pred_chunk in policy_predictions[name]["chunks"]:
-                chunk_time = (
-                    np.arange(start_frame, start_frame + len(pred_chunk))
-                    / dataset_meta.fps
-                )
+                chunk_time = np.arange(start_frame, start_frame + len(pred_chunk)) / dataset_meta.fps
                 ax.plot(
                     chunk_time,
                     pred_chunk[:, dim],
@@ -549,7 +617,7 @@ def create_comparison_plots(
     # Error over time
     ax = axes[action_dim]
     for i, name in enumerate(policy_names):
-        short_name = name.split("/")[-1].split(" ")[0][:15]
+        short_name = name.split(" (")[0]  # Remove policy type suffix
         errors = np.array(policy_predictions[name]["errors_over_time"])
         ax.plot(
             time_axis,
@@ -572,11 +640,8 @@ def create_comparison_plots(
     width = 0.8 / len(policy_names)
 
     for i, name in enumerate(policy_names):
-        short_name = name.split("/")[-1].split(" ")[0][:15]
-        dim_means = [
-            np.array(policy_predictions[name]["per_dim_errors"][d]).mean()
-            for d in range(action_dim)
-        ]
+        short_name = name.split(" (")[0]  # Remove policy type suffix
+        dim_means = [np.array(policy_predictions[name]["per_dim_errors"][d]).mean() for d in range(action_dim)]
         ax.bar(
             x + i * width - 0.4 + width / 2,
             dim_means,
@@ -623,20 +688,30 @@ def run_comparison(cfg: ComparePoliciesConfig):
     preprocessors = []
     policy_names = []
     for path_str in cfg.policy_paths:
-        policy, preprocessor, policy_type = load_policy_and_preprocessor(
-            path_str, cfg.device
-        )
+        policy, preprocessor, policy_type = load_policy_and_preprocessor(path_str, cfg.device)
         policies.append(policy)
         preprocessors.append(preprocessor)
 
         path = Path(path_str)
         if "/" in path_str and not path.exists() and not path.parent.exists():
+            # HuggingFace repo ID
             label = path_str.split("/")[-1]
         else:
-            parts = path.parts
+            # Local path - extract meaningful label
+            parts = list(path.parts)
+            # Remove common suffixes from end
             if parts and parts[-1] == "pretrained_model":
                 parts = parts[:-1]
-            if len(parts) >= 2:
+            # Check for checkpoint pattern: .../checkpoints/NNNNNN
+            if len(parts) >= 2 and parts[-2] == "checkpoints":
+                checkpoint_num = parts[-1]
+                parts = parts[:-2]  # Remove both 'checkpoints' and the number
+                # Include checkpoint number in label
+                if parts:
+                    label = f"{parts[-1]}/{checkpoint_num}"
+                else:
+                    label = checkpoint_num
+            elif len(parts) >= 2:
                 label = "/".join(parts[-2:])
             elif len(parts) == 1:
                 label = parts[0]
@@ -654,8 +729,7 @@ def run_comparison(cfg: ComparePoliciesConfig):
             max_delay = policy.config.rtc_max_delay
             if cfg.rtc_delay > max_delay:
                 raise ValueError(
-                    f"rtc_delay ({cfg.rtc_delay}) exceeds rtc_max_delay ({max_delay}) "
-                    f"for policy {policy_type}"
+                    f"rtc_delay ({cfg.rtc_delay}) exceeds rtc_max_delay ({max_delay}) for policy {policy_type}"
                 )
 
     # Load dataset metadata

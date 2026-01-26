@@ -52,6 +52,7 @@ class EvalRTCSensitivityConfig:
     video_backend: str = "pyav"
     device: str | None = None
     joint_idx: int = 0  # Which joint to plot
+    observation_indices: str = ""  # Comma-separated indices, e.g. "10,50,100". Overrides n_observations/seed.
 
     def __post_init__(self):
         if not self.policy_path:
@@ -484,33 +485,27 @@ def create_plot(
         # Plot current observation position at t=0
         ax.plot(0, current_joint, "ko", markersize=10, label="Current State (t)", zorder=10)
 
-        # Plot predictions with colormap, each with its own time axis and ground truth
-        cmap = plt.cm.viridis
-        for idx_delay, (delay, pred, prefix, gt) in enumerate(
-            zip(delay_res["delays"], delay_res["predictions"], delay_res["prefixes"], delay_res["ground_truths"])
-        ):
-            color = cmap(idx_delay / rtc_max_delay)
+        # Plot ground truth: all actions from t+1 to t+rtc_max_delay+chunk_size
+        # sample["action"] contains actions at t+1, t+2, ..., t+rtc_max_delay+chunk_size
+        n_gt_actions = rtc_max_delay + chunk_size
+        gt_time_axis = np.arange(1, n_gt_actions + 1) / fps
+        actions_all = sample["action"].cpu().numpy()  # [rtc_max_delay + chunk_size, action_dim]
+        gt_joint = actions_all[:, joint_idx]
+        ax.plot(gt_time_axis, gt_joint, "k:", linewidth=2, alpha=0.6, label="Ground Truth", zorder=5)
 
-            # V2: For delay=d, predictions are for t+d+1 to t+d+chunk_size
-            # Time axis for predictions: (d+1)/fps to (d+chunk_size)/fps
+        # Plot predictions for each delay
+        cmap = plt.cm.viridis
+        for idx_delay, (delay, pred) in enumerate(zip(delay_res["delays"], delay_res["predictions"])):
+            color = cmap(idx_delay / max(rtc_max_delay, 1))
+
+            # For delay=d, predictions are for t+d+1 to t+d+chunk_size
             pred_time_axis = np.arange(chunk_size) / fps + (delay + 1) / fps
             pred_joint = pred[:, joint_idx]
             ax.plot(pred_time_axis, pred_joint, color=color, alpha=0.7, linewidth=1.5, label=f"delay={delay}")
 
-            # Plot ground truth for this delay (same time axis as prediction)
-            gt_joint = gt[:, joint_idx]
-            ax.plot(pred_time_axis, gt_joint, color=color, linestyle=":", alpha=0.5, linewidth=1.5)
-
-            # Plot prefix if available
-            # V2: Prefix for delay=d covers actions at t+1 to t+d, i.e., times 1/fps to d/fps
-            if prefix is not None:
-                prefix_joint = prefix[:, joint_idx]
-                prefix_time = np.arange(1, delay + 1) / fps
-                ax.plot(prefix_time, prefix_joint, color=color, linestyle="--", alpha=0.6, linewidth=1.5)
-
         ax.set_xlabel("Time from observation (s)")
         ax.set_ylabel(f"Joint {joint_idx} (rad)")
-        ax.set_title(f"Obs {idx_sample}: Delay Experiment (solid=pred, dotted=GT)")
+        ax.set_title(f"Obs {idx_sample}: Delay Experiment")
         ax.legend(loc="best", fontsize=7)
         ax.grid(True, alpha=0.3)
 
@@ -572,6 +567,11 @@ def main(cfg: EvalRTCSensitivityConfig):
     """Main entry point for RTC sensitivity evaluation."""
     init_logging()
 
+    # Set seed first for reproducibility
+    logging.info(f"Setting seed: {cfg.seed}")
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+
     # Setup device
     if cfg.device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -626,17 +626,23 @@ def main(cfg: EvalRTCSensitivityConfig):
         dataset_meta,
     )
 
-    # Sample observation indices
-    logging.info(f"Sampling {cfg.n_observations} observations")
-    idx_samples = sample_observation_indices(
-        from_idx,
-        to_idx,
-        rtc_max_delay,
-        chunk_size,
-        cfg.n_observations,
-        cfg.seed,
-    )
-    logging.info(f"Sampled indices: {idx_samples}")
+    # Get observation indices (explicit or sampled)
+    if cfg.observation_indices:
+        # Use explicit indices
+        idx_samples = [int(x.strip()) for x in cfg.observation_indices.split(",")]
+        logging.info(f"Using explicit observation indices: {idx_samples}")
+    else:
+        # Sample observation indices
+        logging.info(f"Sampling {cfg.n_observations} observations")
+        idx_samples = sample_observation_indices(
+            from_idx,
+            to_idx,
+            rtc_max_delay,
+            chunk_size,
+            cfg.n_observations,
+            cfg.seed,
+        )
+        logging.info(f"Sampled indices: {idx_samples}")
 
     # Run experiments
     logging.info("Running experiments...")
