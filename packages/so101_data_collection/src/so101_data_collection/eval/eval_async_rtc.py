@@ -929,7 +929,7 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
             logging.info("Running homing sequence...")
             try:
                 # Lazy import to avoid potential import-time side effects
-                from so101_data_collection.zxtra.homing import run_homing_sequence
+                from so101_data_collection.shared.homing import run_homing_sequence
 
                 run_homing_sequence(robot, enable_rerun_logging=False)
             except Exception as e:
