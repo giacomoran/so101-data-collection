@@ -40,7 +40,8 @@ Usage:
         --robot.id=arm_follower_0 \
         --policy.path=outputs/model_with_rtc/pretrained_model \
         --dataset_repo_id=giacomoran/cube_hand_guided \
-        --fps=30 \
+        --fps_policy=10 \
+        --fps_command=30 \
         --timesteps_execution_latency=3 \
         --display_data=true
 """
@@ -100,7 +101,8 @@ class EvalAsyncRTCConfig:
     policy: PreTrainedConfig | None = None
 
     # Control parameters
-    fps: int = 30
+    fps_policy: int = 10  # Policy rate (how often we step through action chunks)
+    fps_command: int = 30  # Robot command rate (with interpolation between policy actions)
     episode_time_s: float = 60.0
 
     # Override n_action_steps from policy config (None = use policy default)
@@ -118,7 +120,6 @@ class EvalAsyncRTCConfig:
 
     # Display and feedback
     display_data: bool = False
-    fps_display_data: int = 30
     play_sounds: bool = True
 
     # Debug options
@@ -139,9 +140,11 @@ class EvalAsyncRTCConfig:
         if self.policy is None:
             raise ValueError("A policy must be provided via --policy.path=...")
 
-        # Validate fps_display_data is multiple of fps
-        if self.fps_display_data % self.fps != 0:
-            raise ValueError(f"fps_display_data ({self.fps_display_data}) must be a multiple of fps ({self.fps})")
+        # Validate fps_command is multiple of fps_policy
+        if self.fps_command % self.fps_policy != 0:
+            raise ValueError(f"fps_command ({self.fps_command}) must be a multiple of fps_policy ({self.fps_policy})")
+        if self.fps_command < self.fps_policy:
+            raise ValueError(f"fps_command ({self.fps_command}) must be >= fps_policy ({self.fps_policy})")
         if self.timesteps_execution_latency < 0:
             raise ValueError("timesteps_execution_latency must be >= 0")
 
@@ -345,13 +348,13 @@ def thread_actor_fn(
     7. Release lock
     8. Execute action if available
 
-    If display_data is enabled:
-    - Control pipeline runs at fps
-    - Loop runs at fps_display_data (faster)
-    - On frames between control frames: just read obs and log to rerun with last sent action
+    If display_data is enabled or fps_command > fps_policy:
+    - Control pipeline runs at fps_policy
+    - Loop runs at fps_command
+    - On frames between control frames: interpolate actions for smoother motion
     """
-    # Determine effective FPS: fps_display_data if display_data enabled, else fps
-    fps_target = cfg.fps_display_data if cfg.display_data else cfg.fps
+    # Loop always runs at fps_command (robot command rate)
+    fps_target = cfg.fps_command
     # Duration in seconds (precise_sleep expects seconds)
     duration_s_frame_target = 1.0 / fps_target
     count_executed_actions = 0
@@ -360,11 +363,16 @@ def thread_actor_fn(
     # Execution latency compensation (in control frames)
     timesteps_execution_latency = cfg.timesteps_execution_latency
 
-    # Compute frame skip ratio: how many display frames per control frame
-    num_frames_per_control_frame = cfg.fps_display_data // cfg.fps
+    # Compute frame skip ratio: how many command frames per control frame
+    num_frames_per_control_frame = cfg.fps_command // cfg.fps_policy
 
-    # Track last sent action for display at higher fps
+    # Track last sent action for display
     robot_action_last_executed = None
+
+    # Interpolation state (used when fps_command > fps_policy)
+    action_interp_start: torch.Tensor | None = None
+    action_interp_end: torch.Tensor | None = None
+    is_interpolation_ready: bool = False
 
     try:
         timestep = 0  # Execution-time index (aligned with observations)
@@ -457,6 +465,22 @@ def thread_actor_fn(
                     # Store last sent action for display
                     robot_action_last_executed = robot_action
 
+                    # Store interpolation endpoints for non-control frames
+                    action_interp_start = action.clone()
+
+                    # Look ahead for next action
+                    timestep_exec_next = timestep_exec + 1
+                    action_next = None
+                    if action_chunk_for_exec is not None:
+                        action_next = action_chunk_for_exec.action_at(timestep_exec_next)
+                    if action_next is None and state.action_chunk_pending is not None:
+                        action_next = state.action_chunk_pending.action_at(timestep_exec_next)
+
+                    action_interp_end = (
+                        action_next.cpu().clone() if action_next is not None else action_interp_start.clone()
+                    )
+                    is_interpolation_ready = True
+
                 # Get chunk index for logging and rerun
                 idx_chunk = idx_chunk_exec
                 count_remaining_actions_log = count_remaining_actions if count_remaining_actions is not None else -1
@@ -472,10 +496,19 @@ def thread_actor_fn(
                 # Increment timestep only on control frames
                 timestep += 1
             else:
-                # Non-control frame: just get obs and log to rerun
-                pass
+                # Non-control frame: interpolate between policy actions
+                if is_interpolation_ready and action_interp_start is not None:
+                    idx_within_period = idx_frame % num_frames_per_control_frame
+                    t = idx_within_period / num_frames_per_control_frame
 
-            # Log to rerun at fps_display_data with last sent action
+                    action_interp = (1.0 - t) * action_interp_start + t * action_interp_end
+
+                    robot_action_interp = make_robot_action(action_interp.unsqueeze(0), ds_features)
+                    robot.send_action(robot_action_interp)
+
+                    robot_action_last_executed = robot_action_interp
+
+            # Log to rerun at fps_command with last sent action
             if cfg.display_data:
                 log_rerun_data(
                     timestep=timestep,
@@ -767,7 +800,10 @@ def main(cfg: EvalAsyncRTCConfig) -> None:
         # Run episode
         log_say("Starting evaluation", cfg.play_sounds)
 
-        logging.info(f"Starting episode (max {cfg.episode_time_s}s at {cfg.fps} fps)")
+        logging.info(
+            f"Starting episode (max {cfg.episode_time_s}s at {cfg.fps_policy} fps policy, "
+            f"{cfg.fps_command} fps command)"
+        )
         logging.info(f"Execution latency: {cfg.timesteps_execution_latency} frames")
         logging.info(f"Remaining actions threshold: {cfg.threshold_remaining_actions}")
 
