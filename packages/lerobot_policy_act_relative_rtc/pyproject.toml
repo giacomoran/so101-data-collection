@@ -2,7 +2,7 @@
 name = "lerobot_policy_act_relative_rtc"
 version = "0.1.0"
 description = "ACT policy with relative joint representations for LeRobot."
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "lerobot @ git+https://github.com/huggingface/lerobot.git@46e19ae579f80ce66211afafd1c3c649c569131f",
 ]

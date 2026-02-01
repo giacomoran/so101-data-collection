@@ -2,7 +2,7 @@
 name = "so101_data_collection"
 version = "0.1.0"
 description = "Data collection, training, and evaluation for the SO101 robot arm."
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "lerobot[feetech] @ git+https://github.com/huggingface/lerobot.git@46e19ae579f80ce66211afafd1c3c649c569131f",
   "matplotlib>=3.10.8",

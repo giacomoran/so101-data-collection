@@ -4,7 +4,7 @@ This file provides guidance for Claude Code working in this repository.
 
 ## Project Overview
 
-Python 3.10+ monorepo for SO-101 robot arm data collection, training, and evaluation. Uses uv workspace with packages/ structure.
+Python 3.11+ monorepo for SO-101 robot arm data collection, training, and evaluation. Uses uv workspace with packages/ structure.
 
 **Goal**: Benchmark comparing three teleoperation setups (phone teleop, leader teleop, hand-guided) across three manipulation tasks (cube, gba, ball). See `plans/main.md` for full experimental design.
 
@@ -35,7 +35,7 @@ LeRobot is installed from a **pinned git commit** (not PyPI) because the latest 
 IMPORTANT: When you need to understand how LeRobot works internally, explore its source files in
 
 ```
-.venv/lib/python3.10/site-packages/lerobot/
+.venv/lib/python3.11/site-packages/lerobot/
 ```
 
 ## Documentation References
