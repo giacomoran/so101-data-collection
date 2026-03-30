@@ -1,15 +1,37 @@
+[project]
+name = "so101_direct_manipulation"
+version = "0.1.0"
+description = "Direct manipulation data collection, training, and evaluation for the SO101 robot arm."
+requires-python = ">=3.12"
+dependencies = [
+  "lerobot[feetech]",
+  "lerobot_policy_act_smooth",
+  "matplotlib>=3.10.8",
+  "qrcode[pil]>=8.0",
+  "scipy>=1.15.3",
+  "datafusion>=51.0.0",
+  "icecream>=2.1.9",
+]
+
 [tool.uv]
 # Force av to be compiled from source so it links against the system FFmpeg
 # (installed via Nix) instead of using pre-built wheels with bundled FFmpeg
 no-binary-package = ["av"]
 
-[tool.uv.workspace]
-members = ["packages/*"]
+[tool.uv.sources]
+lerobot = { git = "https://github.com/huggingface/lerobot.git", tag = "v0.5.0" }
+lerobot_policy_act_smooth = { path = "../lerobot-policy-act-smooth", editable = true }
+
+[build-system]
+requires = ["uv_build>=0.9.21,<0.10.0"]
+build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "pdbpp>=0.11.7",
-    "ruff>=0.14.11",
+  "nvidia-ml-py>=12.560.30",
+  "pdbpp>=0.11.7",
+  "pytest>=9.0.2",
+  "ruff>=0.14.11",
 ]
 
 [tool.ruff]
@@ -17,5 +39,5 @@ line-length = 120
 
 [tool.ruff.lint]
 ignore = [
-    "F541", # f-string without any placeholders
+  "F541", # f-string without any placeholders
 ]

@@ -1,6 +1,6 @@
-# SO101 Data Collection
+# SO101 Direct Manipulation
 
-Exploring data collection strategies for the SO101 robot arm.
+Exploring data collection through direct manipulation for the SO101 robot arm.
 
 ## Latency Measurement Tools
 

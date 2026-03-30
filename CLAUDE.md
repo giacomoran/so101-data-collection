@@ -4,18 +4,18 @@ This file provides guidance for Claude Code working in this repository.
 
 ## Project Overview
 
-Python 3.11+ monorepo for SO-101 robot arm data collection, training, and evaluation. Uses uv workspace with packages/ structure.
+Python 3.12+ project for SO-101 robot arm direct manipulation data collection, training, and evaluation.
 
-**Goal**: Benchmark comparing three teleoperation setups (phone teleop, leader teleop, hand-guided) across three manipulation tasks (cube, gba, ball). See `plans/main.md` for full experimental design.
+**Goal**: Benchmark comparing two data collection strategies (teleoperation, direct-manipulation) across three manipulation tasks (cube, gba, ball). See `plans/main.md` for full experimental design.
 
-### Packages
+### Dependencies
 
-- **so101_data_collection**: Data collection scripts for the benchmark
-- **lerobot_policy_act_relative_rtc**: Custom ACT policy using relative joint representations (observation deltas + relative actions) with optional Real-Time Chunking (RTC) for smoother inference
+- **LeRobot 0.5.0**: Robotics data collection and training framework
+- **lerobot_policy_act_smooth**: ACT policy with prefix conditioning and async inference (editable dep from `../lerobot-policy-act-smooth`)
 
 ## Environment Setup
 
-This project uses **nix + uv** (not conda as LeRobot docs suggest).
+This project uses **nix + uv** (not conda).
 
 To enter the dev environment:
 
@@ -30,12 +30,12 @@ Remember to source the virtual environment at `.venv` when running Python script
 
 This project uses the LeRobot library for robotics data collection with the SO101 robot arm.
 
-LeRobot is installed from a **pinned git commit** (not PyPI) because the latest PyPI version (0.4.2) is outdated. See `pyproject.toml` for the exact commit hash.
+LeRobot is installed from the **v0.5.0 git tag** (not yet on PyPI). See `pyproject.toml` for the source config.
 
 IMPORTANT: When you need to understand how LeRobot works internally, explore its source files in
 
 ```
-.venv/lib/python3.11/site-packages/lerobot/
+.venv/lib/python3.12/site-packages/lerobot/
 ```
 
 ## Documentation References
@@ -49,56 +49,18 @@ When working with LeRobot datasets, refer to the official documentation:
 
 ## Naming Conventions
 
-- **HuggingFace repos/datasets**: Use underscores `_` instead of hyphens `-` in names (e.g., `cube_hand_guided` not `cube-hand-guided`)
+- **HuggingFace repos/datasets**: Use underscores `_` instead of hyphens `-` in names (e.g., `cube_direct_manipulation` not `cube-direct-manipulation`)
 - **Task names**: Use short names: `cube`, `gba`, `ball` (not `pick_place_cube`, `press_gba`, `throw_ball`)
 
-### Code Naming
+## Linting and formatting
 
-Follow a noun-first approach for variables and constants, for example `idChat` instead of `chatId`. Follow a verb-first approach for functions, for example `computeContentFromTree` or `fetchDataUser`. Notice that we still follow the noun-first approach, it's `fetchDataUser` instead of `fetchUserData`. Plural applies to the noun, for example for multiple user ids use `idsUser` instead of `idsUsers` or `idUsers`.
-
-**Noun-first patterns:**
-- Timesteps: `timestep_obs`, `timestep_action` (not `obs_timestep`)
-- Observations: `dict_obs` (raw dict), `proprio_obs` (proprioception), `dict_obs_current`
-- Actions: `action_chunk_pending`, `action_chunk_active`, `tensor_action`
-- Events: `event_shutdown`, `event_inference_requested`
-- Counts: `count_actions`, `count_total_actions` (not `action_count`)
-- Indices: `idx_chunk`, `idx_frame` (not `chunk_idx`)
-- Threads: `thread_inference`, `thread_actor`
-- Paths: `path_recording`, `path_output`
-- Trackers: `tracker_latency`
-- Booleans: `is_inference_running`, `is_control_frame` (use `is_` prefix for state flags)
-
-**Exception: Library Interface Consistency**
-
-When interfacing with external libraries (e.g., LeRobot, PyTorch, ACTRelativeRTC), preserve the library's naming conventions for:
-- Function parameters that match library APIs (e.g., `delay`, `action_prefix` for ACTRelativeRTC)
-- Dict keys that follow library conventions (e.g., `observation.state`, `observation.images.*` for LeRobot)
-- Variables passed directly to library functions (e.g., `robot_action` for `robot.send_action()`)
-- Standard framework naming (e.g., `device` for PyTorch, `policy`, `preprocessor` for LeRobot)
-
-The goal is: use noun-first naming for internal code, but maintain consistency at library boundaries to reduce cognitive friction when reading code that interfaces with external APIs.
-
-**File/folder prefixes:**
-- `bak` prefix/suffix: backup files and folders, ignore unless explicitly asked
-- `tmp` prefix/suffix: temporary files and folders, ignore unless explicitly asked
-- `zxtra` prefix/suffix: extra files and folders (work-in-progress or uncertain), generally ignore
-
-### Nominal Consistency
-
-Align the caller's variable names with the callee's parameter names to reduce cognitive load and make data flow explicit. The variable names outside a function must match the internal parameters exactly. The exception is when handling generic sequences or iterative data, where indexed suffixes (like `_1, _2, _3`) are used to represent distinct instances of the same conceptual type.
-
-## Code Quality
-
-- **Formatting**: Uses ruff for code formatting (auto-runs via Claude Code hook on file save)
-- **Linting**: Uses ruff for linting
+- **Formatting**: Uses ruff for code formatting (auto-runs via Claude Code hook on `.py` file save)
+- **Linting**: Uses ruff for linting (manual only)
 - **Type Checking**: Disabled (no mypy/pyright/ty)
 
 Run manually if needed:
+
 ```bash
 uv run ruff format .
 uv run ruff check .
 ```
-
-## File Organization
-
-- **Plans**: All project plans should be stored in the `plans/` folder.
