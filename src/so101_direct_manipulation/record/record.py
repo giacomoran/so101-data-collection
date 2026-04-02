@@ -16,7 +16,7 @@ attach them to.
 Usage:
     python -m so101_direct_manipulation.record.record \
         --leader.port=/dev/tty.usbmodem575E0080981 \
-        --leader.cameras="{wrist: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+        --cameras="{wrist: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
         --dataset.repo_id=giacomoran/cube_dm \
         --dataset.single_task="Pick up the cube and place it on the target" \
         --dataset.num_episodes=50
@@ -24,11 +24,12 @@ Usage:
 
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pprint import pformat
 
-from lerobot.cameras import CameraConfig  # noqa: F401
+from lerobot.cameras import Camera, CameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.configs import parser
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -49,6 +50,7 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 class DirectManipulationRecordConfig:
     leader: SO101LeaderConfig
     dataset: DatasetRecordConfig
+    cameras: dict[str, CameraConfig] = field(default_factory=dict)
     display_data: bool = False
     play_sounds: bool = True
     resume: bool = False
@@ -60,6 +62,7 @@ class DirectManipulationRecordConfig:
 @safe_stop_image_writer
 def record_loop(
     leader: SO101Leader,
+    cameras: dict[str, Camera],
     events: dict,
     fps: int,
     control_time_s: float,
@@ -91,7 +94,7 @@ def record_loop(
 
         # Read cameras
         images = {}
-        for cam_name, cam in leader.cameras.items():
+        for cam_name, cam in cameras.items():
             images[cam_name] = cam.read_latest()
 
         # In direct manipulation, observation and action come from the same source
@@ -131,9 +134,8 @@ def record(cfg: DirectManipulationRecordConfig) -> LeRobotDataset:
     # --- Hardware setup ---
     leader = SO101Leader(cfg.leader)
 
-    camera_configs = cfg.leader.cameras if cfg.leader.cameras else {}
-    if not camera_configs:
-        raise ValueError("At least one camera is required in --leader.cameras")
+    camera_configs = cfg.cameras
+    assert camera_configs, "At least one camera is required in --cameras"
 
     # --- Dataset features ---
     # Mirror what lerobot-record does: run features through the processor pipeline.
@@ -158,6 +160,7 @@ def record(cfg: DirectManipulationRecordConfig) -> LeRobotDataset:
         ),
     )
 
+    cameras: dict[str, Camera] = {}
     dataset = None
     listener = None
 
@@ -196,6 +199,10 @@ def record(cfg: DirectManipulationRecordConfig) -> LeRobotDataset:
             )
 
         # --- Connect hardware ---
+        cameras = make_cameras_from_configs(camera_configs)
+        for cam in cameras.values():
+            cam.connect()
+
         leader.connect()
 
         listener, events = init_keyboard_listener()
@@ -214,6 +221,7 @@ def record(cfg: DirectManipulationRecordConfig) -> LeRobotDataset:
                 log_say(f"Recording episode {dataset.num_episodes}", play_sounds)
                 record_loop(
                     leader,
+                    cameras,
                     events=events,
                     fps=fps,
                     control_time_s=ds.episode_time_s,
@@ -252,6 +260,10 @@ def record(cfg: DirectManipulationRecordConfig) -> LeRobotDataset:
 
         if leader.is_connected:
             leader.disconnect()
+
+        for cam in cameras.values():
+            if cam.is_connected:
+                cam.disconnect()
 
         if not is_headless() and listener:
             listener.stop()

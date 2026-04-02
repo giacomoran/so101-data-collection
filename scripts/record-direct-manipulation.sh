@@ -9,7 +9,7 @@
 # NOTE: The configuration below is specific to Giacomo's setup.
 # You will need to substitute your own values:
 #   - leader.port: USB port for your leader arm (find with `lerobot-find-port`)
-#   - leader.cameras: Camera indices depend on your system (find with `lerobot-find-cameras`)
+#   - cameras: Camera indices depend on your system (find with `lerobot-find-cameras`)
 
 RESUME_FLAG=""
 TASK=""
@@ -29,17 +29,22 @@ case "$TASK" in
 esac
 
 CAMERAS="{
-  wrist: { type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30, rotation: -90 }
+  wrist: { type: opencv, index_or_path: 1, width: 480, height: 640, fps: 30, rotation: -90 },
+  top:   { type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30 }
 }"
 
+# TODO:
+# --dataset.num_episodes=100 \
 python -m so101_direct_manipulation.record.record \
     $RESUME_FLAG \
-    --leader.id=leader \
-    --leader.port=/dev/tty.usbmodem575E0080981 \
-    --leader.cameras="$CAMERAS" \
-    --dataset.repo_id=giacomoran/"so101_${TASK}"_direct_manipulation \
+    --leader.id=leader_direct_manipulation \
+    --leader.port=/dev/tty.usbmodem5A460824651 \
+    --cameras="$CAMERAS" \
+    --dataset.repo_id="giacomoran/so101_${TASK}_direct_manipulation" \
     --dataset.single_task="$TASK_DESC" \
-    --dataset.num_episodes=100 \
+    --dataset.num_episodes=20 \
     --dataset.fps=30 \
+    --dataset.streaming_encoding=true \
     --dataset.push_to_hub=false \
-    --display_data=false
+    --display_data=false \
+    --play_sounds=false
