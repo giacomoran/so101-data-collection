@@ -24,8 +24,8 @@ echo "=== Training cube direct manipulation ==="
 lerobot-train \
     --policy.type=act_smooth \
     --dataset.repo_id=giacomoran/so101_cube_direct_manipulation \
-    --policy.repo_id=giacomoran/so101_cube_direct_manipulation_smooth_p4f2 \
-    --output_dir="${DIR_BASE}/so101_cube_direct_manipulation_smooth_p4f2" \
+    --policy.repo_id=giacomoran/so101_cube_dm_act_smooth_p4f2 \
+    --output_dir="${DIR_BASE}/so101_cube_dm_act_smooth_p4f2" \
     --policy.input_features="${INPUT_FEATURES}" \
     --steps=${STEPS} \
     --save_freq=${SAVE_FREQ} \
@@ -48,8 +48,8 @@ echo "=== Resuming for extra checkpoints ==="
 
 lerobot-train \
     --resume=true \
-    --config_path="${DIR_BASE}/so101_cube_direct_manipulation_smooth_p4f2/checkpoints/030000/pretrained_model/train_config.json" \
-    --output_dir="${DIR_BASE}/so101_cube_direct_manipulation_smooth_p4f2" \
+    --config_path="${DIR_BASE}/so101_cube_dm_act_smooth_p4f2/checkpoints/030000/pretrained_model/train_config.json" \
+    --output_dir="${DIR_BASE}/so101_cube_dm_act_smooth_p4f2" \
     --steps=30003 \
     --save_freq=1
 
@@ -59,7 +59,7 @@ echo "=== Training complete ==="
 echo "=== Compressing outputs ==="
 cd "${DIR_BASE}"
 
-DIR="so101_cube_direct_manipulation_smooth_p4f2"
+DIR="so101_cube_dm_act_smooth_p4f2"
 ARGS_TAR=""
 
 if [ -d "${DIR}/checkpoints" ]; then
@@ -75,14 +75,14 @@ if [ -d "${DIR}/checkpoints" ]; then
 fi
 
 if [ -n "${ARGS_TAR}" ]; then
-    tar -czvf so101_cube_direct_manipulation_smooth.tar.gz ${ARGS_TAR}
-    echo "Done! Archive: ${DIR_BASE}/so101_cube_direct_manipulation_smooth.tar.gz"
+    tar -czvf so101_cube_dm_act_smooth_p4f2.tar.gz ${ARGS_TAR}
+    echo "Done! Archive: ${DIR_BASE}/so101_cube_dm_act_smooth_p4f2.tar.gz"
 else
     echo "ERROR: No checkpoints found to compress!"
     exit 1
 fi
 
 # To transfer and uncompress on local machine:
-#   Remote:  croc send so101_cube_direct_manipulation_smooth.tar.gz
+#   Remote:  croc send so101_cube_dm_act_smooth_p4f2.tar.gz
 #   Local:   croc <code>
-#            tar -xzvf so101_cube_direct_manipulation_smooth.tar.gz -C /path/to/destination
+#            tar -xzvf so101_cube_dm_act_smooth_p4f2.tar.gz -C /path/to/destination

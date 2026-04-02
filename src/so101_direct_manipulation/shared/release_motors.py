@@ -41,14 +41,22 @@ def main() -> int:
         required=True,
         help="Robot serial port(s) to release (can be specified multiple times)",
     )
-    parser.add_argument("--id", type=str, default="arm_follower_0", help="Robot ID prefix")
+    parser.add_argument(
+        "--id",
+        type=str,
+        action="append",
+        required=True,
+        help="Robot ID(s) matching each --port (can be specified multiple times)",
+    )
     args = parser.parse_args()
+
+    if len(args.id) != len(args.port):
+        parser.error(f"Number of --id ({len(args.id)}) must match number of --port ({len(args.port)})")
 
     logging.basicConfig(level=logging.INFO)
 
     failed = 0
-    for i, port in enumerate(args.port):
-        robot_id = f"{args.id}_{i}" if len(args.port) > 1 else args.id
+    for port, robot_id in zip(args.port, args.id):
         logger.info(f"Releasing motors on {port} (id={robot_id})")
 
         robot_config = SO101FollowerConfig(

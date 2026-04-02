@@ -3,7 +3,7 @@
 # Create a calibration profile for the leader arm for direct manipulation.
 #
 # Usage:
-#   ./scripts/calibrate-direct-manipulation.sh
+#   ./scripts/calibrate-leader-direct-manipulation.sh
 #
 # NOTE: The configuration below is specific to Giacomo's setup.
 # You will need to substitute your own values:
