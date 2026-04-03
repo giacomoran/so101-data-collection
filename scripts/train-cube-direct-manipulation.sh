@@ -35,6 +35,10 @@ lerobot-train \
     --policy.chunk_size=30 \
     --policy.n_action_steps=30 \
     --policy.use_vae=false \
+    --policy.vision_backbone=resnet34 \
+    --policy.pretrained_backbone_weights=ResNet34_Weights.IMAGENET1K_V1 \
+    --policy.pre_norm=true \
+    --policy.n_decoder_layers=4 \
     --policy.length_prefix_past=4 \
     --policy.length_prefix_future=2 \
     --policy.use_action_relative=true \
